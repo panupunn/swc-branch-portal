@@ -1,38 +1,29 @@
 # -*- coding: utf-8 -*-
 """
-WishCo Branch Portal — Phase 1 (Single-table request workflow)
+WishCo Branch Portal — Phase 1 (Single-table, Cached)
 
-สิ่งที่ปรับตามคำขอ:
-1) มี “ตารางเดียว” สำหรับรายการที่พร้อมให้เบิก → ให้ติ๊ก checkbox ต่อรายการ และใส่ “จำนวนที่ต้องการ”
-2) ปุ่ม “เบิกอุปกรณ์” และปุ่ม “ล้างข้อมูล”
-3) เมื่อบันทึกแล้ว สร้างเลขออร์เดอร์ (OrderNo) เดียวรวมหลายบรรทัด
-   - บันทึกลงชีต Requests (เพิ่มคอลัมน์ OrderNo อัตโนมัติถ้ายังไม่มี)
-   - สร้าง Notification ไปยังฝั่งหลัก
-   - มีส่วน “ประวัติออร์เดอร์” ให้เลือกดูย้อนหลัง (เลือก OrderNo แล้วสรุปให้)
-
-หมายเหตุ:
-- ไม่แสดง “คงเหลือ/พร้อมให้เบิก” ในตาราง แต่จะใช้เงื่อนไขภายในในการกรองรายการที่ “พร้อมให้เบิก”
-- ถ้าไม่มีคอลัมน์พร้อมให้เบิก → ใช้เงื่อนไขคงเหลือ>0; ถ้าก็ไม่มี → ให้เบิกได้ทุกชิ้น
-- ถ้าชื่ออุปกรณ์ใน Items ว่าง จะพยายามดึงจากแคตตาล็อก (สแกนทุกแผ่นที่มีคู่คอลัมน์รหัส/ชื่อ)
+- ป้องกันโควตาอ่านเกิน (429) ด้วย cache:
+  * @st.cache_resource สำหรับ client + spreadsheet
+  * @st.cache_data สำหรับอ่านชีต (TTL 45s) แล้ว clear หลังเขียน
+- ตารางเดียวติ๊กเลือก/ใส่จำนวน + ปุ่ม เบิกอุปกรณ์/ล้างข้อมูล
+- สร้าง OrderNo เดียวรวมหลายบรรทัด + แจ้งเตือน
 """
 
 import os, json, time, re
 from datetime import datetime, timezone, timedelta
 import pandas as pd
 import streamlit as st
+import gspread
 
 APP_TITLE = "WishCo Branch Portal — เบิกอุปกรณ์"
 TZ = timezone(timedelta(hours=7))
 
-# ---------- helpers ----------
+# ------------- Utils -------------
 def do_rerun():
-    try:
-        st.rerun()
+    try: st.rerun()
     except Exception:
-        try:
-            st.experimental_rerun()  # สำหรับเวอร์ชัน streamlit เก่า
-        except Exception:
-            pass
+        try: st.experimental_rerun()
+        except Exception: pass
 
 def now_str():
     return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
@@ -46,15 +37,11 @@ def ensure_headers(ws, headers):
         ws.update("A1", [first + missing]); first += missing
     return first
 
-def ws_to_df(ws):
-    vals = ws.get_all_values()
-    return pd.DataFrame(vals[1:], columns=vals[0]) if vals else pd.DataFrame()
-
 def _norm(s: str) -> str:
     s = str(s or "")
     s = s.strip()
-    s = re.sub(r"\s+", "", s)               # remove spaces
-    s = re.sub(r"[^0-9A-Za-zก-๙]+", "", s)  # keep letters/digits/thai
+    s = re.sub(r"\s+", "", s)
+    s = re.sub(r"[^0-9A-Za-zก-๙]+", "", s)
     return s.lower()
 
 def find_col_fuzzy(df, keywords) -> str | None:
@@ -63,16 +50,18 @@ def find_col_fuzzy(df, keywords) -> str | None:
     headers = list(df.columns)
     norm = {h: _norm(h) for h in headers}
     kset = {_norm(k) for k in keywords}
+    # exact
     for h in headers:
         if norm[h] in kset:
             return h
+    # contains
     for h in headers:
         for k in kset:
             if k and (k in norm[h]):
                 return h
     return None
 
-# ---------- Credentials ----------
+# ------------- Credentials -------------
 def load_credentials():
     from google.oauth2.service_account import Credentials
     scope = ["https://www.googleapis.com/auth/spreadsheets",
@@ -93,8 +82,7 @@ def load_credentials():
 
     raw = st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON","").strip() or os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON","").strip()
     if raw:
-        try:
-            info = json.loads(raw)
+        try: info = json.loads(raw)
         except json.JSONDecodeError:
             info = json.loads(raw.replace("\n","").replace("\r",""))
         return Credentials.from_service_account_info(info, scopes=scope)
@@ -113,23 +101,25 @@ def _extract_sheet_id(id_or_url: str) -> str | None:
     if re.fullmatch(r"[a-zA-Z0-9\-_]{20,}", s): return s
     return None
 
-def open_spreadsheet(client, creds):
+def open_spreadsheet(client):
     raw = (
         st.secrets.get("SHEET_ID", "").strip()
         or st.secrets.get("SHEET_URL", "").strip()
         or os.environ.get("SHEET_ID", "").strip()
         or os.environ.get("SHEET_URL", "").strip()
     )
+
     def _try_open(sid: str):
         try:
             return client.open_by_key(sid)
         except Exception as e:
-            sa = getattr(creds, "service_account_email", None)
-            with st.expander("รายละเอียดการเชื่อมต่อ / วิธีแก้ (คลิกเพื่อดู)"):
+            sa = getattr(client.auth, "service_account_email", None)
+            with st.expander("รายละเอียดการเชื่อมต่อ / วิธีแก้ (คลิกเพื่อดู)", expanded=True):
                 st.error(f"เปิดสเปรดชีตไม่สำเร็จ (ID: {sid})")
                 st.write("1) แชร์ไฟล์ให้ Service Account (สิทธิ Editor)")
                 if sa: st.write("Service Account:", f"`{sa}`")
                 st.write("2) ตรวจ SHEET_URL / SHEET_ID ว่าถูกต้อง")
+                st.write("รายละเอียดข้อผิดพลาด (developer):")
                 st.exception(e)
             st.stop()
 
@@ -147,21 +137,33 @@ def open_spreadsheet(client, creds):
         return _try_open(sid2)
     st.stop()
 
-# ---------- App ----------
+# ------------- Cached connectors & readers -------------
+@st.cache_resource(show_spinner=False)
+def get_client_and_ss():
+    creds = load_credentials()
+    client = gspread.authorize(creds)
+    ss = open_spreadsheet(client)
+    return client, ss
+
+@st.cache_data(ttl=45, show_spinner=False)
+def read_sheet_as_df(ss, sheet_name: str) -> pd.DataFrame:
+    """อ่านชีตเป็น DataFrame (cache 45s)"""
+    ws = ss.worksheet(sheet_name)
+    vals = ws.get_all_values()
+    return pd.DataFrame(vals[1:], columns=vals[0]) if vals else pd.DataFrame()
+
+# ------------- App -------------
 def main():
-    import gspread
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
 
-    creds = load_credentials()
-    client = gspread.authorize(creds)
+    client, ss = get_client_and_ss()
     try:
-        st.caption(f"Service Account: `{creds.service_account_email}`")
+        st.caption(f"Service Account: `{client.auth.service_account_email}`")
     except Exception:
         pass
 
-    ss = open_spreadsheet(client, creds)
-
+    # เตรียมเวิร์กชีต (ครั้งละ 1 รอบ)
     titles = [w.title for w in ss.worksheets()]
     ws_users = ss.worksheet("Users") if "Users" in titles else ss.add_worksheet("Users", 1000, 26)
     ws_items = ss.worksheet("Items") if "Items" in titles else ss.add_worksheet("Items", 2000, 26)
@@ -169,14 +171,13 @@ def main():
     ws_noti  = ss.worksheet("Notifications") if "Notifications" in titles else ss.add_worksheet("Notifications", 2000, 26)
     ws_conf  = ss.worksheet("Settings") if "Settings" in titles else ss.add_worksheet("Settings", 1000, 26)
 
-    # เพิ่ม OrderNo ถ้ายังไม่มี
     ensure_headers(ws_users, ["username","password","role","BranchCode"])
     ensure_headers(ws_items, ["รหัส","ชื่อ","คงเหลือ","พร้อมให้เบิก(Y/N)"])
     ensure_headers(ws_reqs,  ["ReqNo","OrderNo","CreatedAt","Branch","Requester","ItemCode","ItemName","Qty","Status","Approver","LastUpdate","Note","NotifiedMain(Y/N)","NotifiedBranch(Y/N)"])
     ensure_headers(ws_noti,  ["NotiID","CreatedAt","TargetApp","TargetBranch","Type","RefID","Message","ReadFlag","ReadAt"])
     ensure_headers(ws_conf,  ["key","value"])
 
-    # ----- Login -----
+    # -------- Login --------
     st.sidebar.subheader("เข้าสู่ระบบสำหรับสาขา/หน่วยงาน")
     if "auth" not in st.session_state:
         st.session_state["auth"] = False; st.session_state["user"] = {}
@@ -184,7 +185,7 @@ def main():
         u = st.sidebar.text_input("ชื่อผู้ใช้")
         p = st.sidebar.text_input("รหัสผ่าน", type="password")
         if st.sidebar.button("ล็อกอิน", use_container_width=True):
-            dfu = ws_to_df(ws_users)
+            dfu = read_sheet_as_df(ss, "Users")
             if dfu.empty: st.sidebar.error("ไม่มีผู้ใช้ในชีต Users"); st.stop()
             cu = find_col_fuzzy(dfu, {"username","user","บัญชีผู้ใช้","ชื่อผู้ใช้"})
             cp = find_col_fuzzy(dfu, {"password","รหัสผ่าน"})
@@ -208,32 +209,40 @@ def main():
     branch_code = st.session_state["user"]["branch"]
     username    = st.session_state["user"]["username"]
 
-    # ----- READ INVENTORY -----
+    # -------- Inventory (single table) --------
     st.header("📦 รายการอุปกรณ์ที่พร้อมให้เบิก")
-    dfi = ws_to_df(ws_items)
-    if dfi.empty: st.info("ยังไม่มีข้อมูลใน Items"); st.stop()
 
-    c_code  = find_col_fuzzy(dfi, {"รหัส","itemcode","code","sku","part","partno","partnumber"})
-    c_name  = find_col_fuzzy(dfi, {"ชื่อ","ชื่ออุปกรณ์","ชื่อสินค้า","name","รายการ","รายละเอียด","description","desc","itemname","product"})
-    c_qty   = find_col_fuzzy(dfi, {"คงเหลือ","qty","จำนวน","stock","balance","remaining","remain","จำนวนคงเหลือ"})
-    c_ready = find_col_fuzzy(dfi, {"พร้อมให้เบิก","พร้อมให้เบิก(y/n)","ready","available","ให้เบิก","allow","เปิดให้เบิก"})
+    dfi = read_sheet_as_df(ss, "Items")
+    if dfi.empty:
+        st.info("ยังไม่มีข้อมูลใน Items"); st.stop()
+
+    c_code = find_col_fuzzy(dfi, {"รหัส","itemcode","code","sku","part","partno","partnumber"})
     if not c_code:
         st.error("Items: หา 'รหัส' ไม่พบ"); st.stop()
-    if not c_name:  # เดาคอลัมน์ชื่อถ้าไม่เจอ
+
+    # เลือกคอลัมน์ชื่อจากหลายตัวเลือกและหยิบตัวที่มีข้อมูลมากที่สุด
+    name_candidates = []
+    for keys in [
+        {"ชื่ออุปกรณ์","ชื่อสินค้า","itemname","productname"},
+        {"ชื่อ","name","รายการ","description","desc"},
+    ]:
+        c = find_col_fuzzy(dfi, keys)
+        if c: name_candidates.append(c)
+    if name_candidates:
+        c_name = max(name_candidates, key=lambda c: dfi[c].astype(str).str.strip().ne("").sum())
+    else:
         others = [c for c in dfi.columns if c != c_code]
         c_name = others[0] if others else None
 
-    # สร้างชื่อแสดงผล (ถ้าว่างจะลองดึงจากแคตตาล็อก)
     name_display = dfi[c_name].astype(str).str.strip() if c_name else pd.Series([""]*len(dfi))
+
+    # ดึงชื่อจากแคตตาล็อกถ้าว่าง
     if name_display.eq("").any():
-        # สแกนทุกแผ่นหา (รหัส,ชื่อ)
         system_tabs = {"Users","Items","Requests","Notifications","Settings"}
         for w in ss.worksheets():
-            if w.title in system_tabs: 
-                continue
-            dfm = ws_to_df(w)
-            if dfm.empty: 
-                continue
+            if w.title in system_tabs: continue
+            dfm = read_sheet_as_df(ss, w.title)
+            if dfm.empty: continue
             m_code = find_col_fuzzy(dfm, {"รหัส","itemcode","code","sku","part","partno","partnumber"})
             m_name = find_col_fuzzy(dfm, {"ชื่อ","ชื่ออุปกรณ์","ชื่อสินค้า","name","รายการ","description","desc"})
             if m_code and m_name:
@@ -242,11 +251,18 @@ def main():
                 for idx, row in dfi.iterrows():
                     if not name_display.iloc[idx]:
                         code = str(row[c_code]).strip()
-                        if code in mp: name_display.iloc[idx] = mp[code]
-                if not name_display.eq("").any():
-                    break
+                        if code in mp:
+                            name_display.iloc[idx] = mp[code]
+                if not name_display.eq("").any(): break
 
-    # filter พร้อมให้เบิก (ไม่แสดง stock)
+    # กำหนดเงื่อนไขพร้อมให้เบิก
+    c_qty   = find_col_fuzzy(dfi, {"คงเหลือ","qty","จำนวน","stock","balance","remaining","remain","จำนวนคงเหลือ"})
+    c_ready = find_col_fuzzy(dfi, {
+        "พร้อมให้เบิก","พร้อมให้เบิก(y/n)","ready","available",
+        "ให้เบิก","allow","เปิดให้เบิก",
+        "ใช้งาน","สถานะ","active","enabled","availableflag"
+    })
+
     if c_ready:
         ready_mask = dfi[c_ready].astype(str).str.upper().str.strip().isin(["Y","YES","TRUE","1"])
     elif c_qty:
@@ -256,11 +272,10 @@ def main():
 
     ready_df = dfi[ready_mask].copy()
     name_ready = name_display[ready_mask].copy()
+
     if ready_df.empty:
         st.warning("ยังไม่มีอุปกรณ์ที่พร้อมให้เบิก"); st.stop()
 
-    # ---------- SINGLE TABLE SELECT (checkbox + qty) ----------
-    # เตรียม DataFrame สำหรับ editor
     base_df = pd.DataFrame({
         "รหัส": ready_df[c_code].astype(str).values,
         "ชื่อ":  name_ready.replace("", "(ไม่มีชื่อ)").values,
@@ -268,7 +283,6 @@ def main():
         "จำนวนที่ต้องการ": [0] * len(ready_df),
     })
 
-    # ใช้ค่าจาก session เพื่อคงการแก้ไขระหว่าง rerun
     if "order_table" not in st.session_state or st.session_state.get("order_table_shape") != base_df.shape:
         st.session_state["order_table"] = base_df.copy()
         st.session_state["order_table_shape"] = base_df.shape
@@ -284,7 +298,6 @@ def main():
         },
         hide_index=True,
     )
-    # อัพเดต session ให้ตรงกับ editor
     st.session_state["order_table"] = edited
 
     col1, col2 = st.columns([1,1])
@@ -297,44 +310,37 @@ def main():
         st.success("ล้างการเลือกแล้ว")
         time.sleep(0.3); do_rerun()
 
-    # ----- SUBMIT -----
+    # -------- Submit --------
     if submit:
         sel = edited[(edited["เลือก"] == True) & (pd.to_numeric(edited["จำนวนที่ต้องการ"], errors="coerce").fillna(0) > 0)].copy()
         if sel.empty:
             st.warning("กรุณาเลือกอุปกรณ์อย่างน้อย 1 รายการ และระบุจำนวน"); st.stop()
 
-        # สร้าง OrderNo เดียวรวมหลายบรรทัด
         order_no = f"ORD-{branch_code}-{datetime.now(TZ).strftime('%Y%m%d-%H%M%S')}"
         ts = now_str()
 
-        # เขียนลง Requests (เพิ่มหัว OrderNo ไว้แล้วด้านบน)
-        req_headers = ws_reqs.row_values(1)
-        rows = []
+        # เขียน Requests
         for _, r in sel.iterrows():
-            rows.append([
-                "",                                # ReqNo จะใส่ภายหลังต่อบรรทัด
-                order_no,                           # OrderNo
-                ts,                                 # CreatedAt
-                branch_code,                        # Branch
-                username,                           # Requester
-                r["รหัส"],                          # ItemCode
-                r["ชื่อ"],                           # ItemName
-                str(int(r["จำนวนที่ต้องการ"])),       # Qty
-                "pending",                          # Status
-                "",                                 # Approver
-                ts,                                 # LastUpdate
-                "",                                 # Note
-                "N",                                # NotifiedMain(Y/N)
-                "N",                                # NotifiedBranch(Y/N)
-            ])
-
-        # เติม ReqNo ให้แต่ละแถวแล้ว append
-        for line in rows:
             req_no = f"REQ-{branch_code}-{datetime.now(TZ).strftime('%Y%m%d-%H%M%S')}"
-            line[0] = req_no
-            ws_reqs.append_row(line, value_input_option="USER_ENTERED")
+            row = [
+                req_no,               # ReqNo
+                order_no,             # OrderNo
+                ts,                   # CreatedAt
+                branch_code,          # Branch
+                username,             # Requester
+                r["รหัส"],            # ItemCode
+                r["ชื่อ"],             # ItemName
+                str(int(r["จำนวนที่ต้องการ"])),  # Qty
+                "pending",            # Status
+                "",                   # Approver
+                ts,                   # LastUpdate
+                "",                   # Note
+                "N",                  # NotifiedMain(Y/N)
+                "N",                  # NotifiedBranch(Y/N)
+            ]
+            ws_reqs.append_row(row, value_input_option="USER_ENTERED")
 
-        # แจ้งเตือนให้ฝั่งหลัก (รวมทั้งออร์เดอร์)
+        # แจ้งเตือน (Notifications)
         n_headers = ws_noti.row_values(1)
         noti = {
             "NotiID": f"NOTI-{datetime.now(TZ).strftime('%Y%m%d-%H%M%S')}",
@@ -343,29 +349,31 @@ def main():
             "TargetBranch": branch_code,
             "Type": "ORDER_CREATED",
             "RefID": order_no,
-            "Message": f"{branch_code} สร้างคำสั่งเบิก {order_no} จำนวน {len(rows)} รายการ โดย {username}",
+            "Message": f"{branch_code} สร้างคำสั่งเบิก {order_no} จำนวน {len(sel)} รายการ โดย {username}",
             "ReadFlag": "N",
             "ReadAt": "",
         }
         ws_noti.append_row([noti.get(h,"") for h in n_headers], value_input_option="USER_ENTERED")
 
-        # สรุปผลออร์เดอร์ทันที
+        # เคลียร์ cache การอ่านชีต เพื่อให้หน้า History รีเฟรชทันที
+        st.cache_data.clear()
+
         with st.success(f"สร้างคำสั่งเบิกสำเร็จ: **{order_no}**"):
             st.write("สรุปรายการในออร์เดอร์:")
-            st.dataframe(sel[["รหัส","ชื่อ","จำนวนที่ต้องการ"]].rename(columns={"จำนวนที่ต้องการ":"Qty"}), use_container_width=True)
+            st.dataframe(sel[["รหัส","ชื่อ","จำนวนที่ต้องการ"]].rename(columns={"จำนวนที่ต้องการ":"Qty"}),
+                         use_container_width=True)
 
-        # เคลียร์ตารางเลือก
         st.session_state.pop("order_table", None)
         st.session_state.pop("order_table_shape", None)
 
-    # ----- HISTORY (เลือกดูตาม OrderNo) -----
+    # -------- History --------
     st.markdown("### 🧾 ประวัติคำสั่งเบิก (ตามออร์เดอร์)")
-    dfr = ws_to_df(ws_reqs)
+    dfr = read_sheet_as_df(ss, "Requests")
     if not dfr.empty:
         c_branch = find_col_fuzzy(dfr, {"Branch"})
         c_user   = find_col_fuzzy(dfr, {"Requester"})
         c_order  = find_col_fuzzy(dfr, {"OrderNo"})
-        c_code   = find_col_fuzzy(dfr, {"ItemCode","รหัส"})
+        c_code2  = find_col_fuzzy(dfr, {"ItemCode","รหัส"})
         c_name2  = find_col_fuzzy(dfr, {"ItemName","ชื่อ"})
         c_qty2   = find_col_fuzzy(dfr, {"Qty","จำนวน"})
         c_status = find_col_fuzzy(dfr, {"Status","สถานะ"})
@@ -378,10 +386,10 @@ def main():
                 ord_sel = st.selectbox("เลือกออร์เดอร์", orders)
                 sub = my[my[c_order]==ord_sel].copy()
                 if c_created: sub = sub.sort_values(c_created)
-                show_cols = [c_code, c_name2, c_qty2, c_status]
+                show_cols = [c_code2, c_name2, c_qty2, c_status]
                 show_cols = [c for c in show_cols if c]
                 st.dataframe(sub[show_cols].rename(columns={
-                    c_code:"รหัส", c_name2:"ชื่อ", c_qty2:"Qty", c_status:"สถานะ"
+                    c_code2:"รหัส", c_name2:"ชื่อ", c_qty2:"Qty", c_status:"สถานะ"
                 }), use_container_width=True, height=260)
             else:
                 st.info("ยังไม่มีคำสั่งเบิกของคุณ")
