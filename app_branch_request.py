@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-WishCo Branch Portal — Phase 1 (On-demand + 429-safe, Patched with multi-select editor & full history)
+WishCo Branch Portal — Phase 1 (429-safe, Multi-select, Quick +/- adjust & Full history)
 
 - แท็บ "เบิกอุปกรณ์": เลือกอุปกรณ์/จำนวนได้หลายรายการ -> กด "เบิกอุปกรณ์" จะสร้าง OrderNo เดียว
+- เพิ่มบล็อก "ปรับจำนวนอย่างรวดเร็ว" พร้อมปุ่ม +/− ต่อรายการที่ติ๊กเลือกแล้ว
 - แท็บ "ประวัติคำสั่งเบิก": แสดง "ทุกรายการที่ทำเบิก" พร้อม เวลา + ออเดอร์ + รหัส + ชื่อ + จำนวน + สถานะ
 """
 
@@ -99,7 +100,6 @@ def load_credentials():
         try:
             info = json.loads(raw)
         except json.JSONDecodeError:
-            # กันกรณีวางแล้วมี \n แปลก ๆ
             info = json.loads(raw.replace("\n", "\\n"))
         return Credentials.from_service_account_info(info, scopes=scope)
 
@@ -414,6 +414,45 @@ def main():
 
         st.session_state["prev_sel_idx"] = curr_set
         st.session_state["order_table"] = edited
+
+        # ====== PATCH: ปรับจำนวนอย่างรวดเร็ว (+ / −) ======
+        selected_idx = list(
+            st.session_state["order_table"].index[
+                st.session_state["order_table"]["เลือก"] == True
+            ]
+        )
+
+        if selected_idx:
+            st.markdown("#### 🔢 ปรับจำนวนอย่างรวดเร็ว")
+
+            h1, h2, h3, h4, h5 = st.columns([2, 5, 1, 1, 1])
+            h1.markdown("**รหัส**")
+            h2.markdown("**ชื่อ**")
+            h3.markdown("**−**")
+            h4.markdown("**จำนวน**")
+            h5.markdown("**+**")
+
+            for i in selected_idx:
+                row = st.session_state["order_table"].loc[i]
+                q = int(pd.to_numeric(row["จำนวนที่ต้องการ"], errors="coerce") or 0)
+                if q <= 0:
+                    q = 1
+                    st.session_state["order_table"].loc[i, "จำนวนที่ต้องการ"] = q
+
+                c1, c2, c3, c4, c5 = st.columns([2, 5, 1, 1, 1])
+                c1.write(str(row["รหัส"]))
+                c2.write(str(row["ชื่อ"]))
+
+                if c3.button("−", key=f"qminus_{i}") and q > 1:
+                    st.session_state["order_table"].loc[i, "จำนวนที่ต้องการ"] = q - 1
+                    do_rerun()
+
+                c4.markdown(f"<div style='text-align:center;font-weight:700'>{q}</div>", unsafe_allow_html=True)
+
+                if c5.button("+", key=f"qplus_{i}"):
+                    st.session_state["order_table"].loc[i, "จำนวนที่ต้องการ"] = q + 1
+                    do_rerun()
+        # ===================================================
 
         col1, col2 = st.columns([1, 1])
         submit = col1.button("✅ เบิกอุปกรณ์", type="primary", use_container_width=True)
