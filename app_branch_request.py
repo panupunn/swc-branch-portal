@@ -1,20 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-WishCo Branch Portal — Phase 1 (Single-table, Cached, Patched)
-
-- ใช้ @st.cache_resource แคช client + spreadsheet
-- ใช้ @st.cache_data (TTL 90s) แคชการอ่านชีต; เคลียร์หลังเขียน
-- เลิกเรียก ss.worksheets() (แพง/ชนโควตา) → เปิดเฉพาะแผ่นที่ต้องใช้ด้วย try/except
-- ตารางเดียว: ติ๊กเลือก + ใส่จำนวน + ปุ่ม “เบิกอุปกรณ์ / ล้างข้อมูล”
-- สร้าง OrderNo เดียวสำหรับหลายบรรทัด, บันทึก Requests และ Notifications
+WishCo Branch Portal — Phase 1 (Patched to avoid 429):
+- แคช mapping แผ่นงาน (title -> sheetId) 5 นาที (อ่าน metadata แค่ครั้งเดียว)
+- เปิดแผ่นงานด้วย sheetId (get_worksheet_by_id) เพื่อลดการ fetch metadata ซ้ำ
+- มี Exponential Backoff เมื่อเจอ APIError 429
+- โครงสร้าง “ตารางเดียว” + OrderNo ตามที่ตกลง
 """
 
-import os, json, time, re
+import os, json, time, re, random
 from datetime import datetime, timezone, timedelta
 import pandas as pd
 import streamlit as st
 import gspread
-from gspread.exceptions import WorksheetNotFound
+from gspread.exceptions import WorksheetNotFound, APIError
 
 APP_TITLE = "WishCo Branch Portal — เบิกอุปกรณ์"
 TZ = timezone(timedelta(hours=7))
@@ -135,6 +133,32 @@ def open_spreadsheet(client):
         return _try_open(sid2)
     st.stop()
 
+# ----------------- Retry helper -----------------
+def _is_429(e: Exception) -> bool:
+    msg = str(e)
+    if "429" in msg and "Quota exceeded" in msg:
+        return True
+    try:
+        code = getattr(getattr(e, "response", None), "status_code", None)
+        return code == 429
+    except Exception:
+        return False
+
+def with_retry(func, *args, **kwargs):
+    """เรียกฟังก์ชัน gspread พร้อม exponential backoff เมื่อเจอ 429"""
+    attempt = 0
+    while True:
+        try:
+            return func(*args, **kwargs)
+        except APIError as e:
+            if _is_429(e) and attempt < 5:
+                wait = (2 ** attempt) + random.uniform(0, 0.5)
+                st.info(f"โควต้าอ่านเกินชั่วคราว รอ {wait:.1f}s แล้วลองใหม่…")
+                time.sleep(wait)
+                attempt += 1
+                continue
+            raise
+
 # ----------------- Cached connectors & readers -----------------
 @st.cache_resource(show_spinner=False)
 def get_client_and_ss():
@@ -143,12 +167,41 @@ def get_client_and_ss():
     ss = open_spreadsheet(client)
     return client, ss
 
+@st.cache_data(ttl=300, show_spinner=False)
+def get_worksheets_map() -> dict:
+    """อ่าน metadata แค่ครั้งเดียว แล้วแคช 5 นาที: {title: sheetId}"""
+    _, ss = get_client_and_ss()
+    wss = with_retry(ss.worksheets)
+    lst = wss()
+    # gspread Worksheet.id = sheetId (int)
+    return {w.title: w.id for w in lst}
+
+def get_or_create_ws(ss, title: str, rows: int = 1000, cols: int = 26):
+    """เปิดแผ่นงานด้วย sheetId ถ้ามี; ถ้าไม่มีให้สร้าง แล้วเคลียร์ cache mapping"""
+    try:
+        mp = get_worksheets_map()
+        if title in mp:
+            return with_retry(ss.get_worksheet_by_id, mp[title])
+        # ไม่มี → สร้าง
+        ws = with_retry(ss.add_worksheet, title, rows, cols)
+        st.cache_data.clear()  # เคลียร์ mapping เพื่อให้เห็นแผ่นงานใหม่
+        return ws
+    except APIError as e:
+        if _is_429(e):
+            # โควต้าเกิน — แจ้งและหยุดอย่างสุภาพ
+            with st.expander("รายละเอียดการเชื่อมต่อ / ข้อผิดพลาด (คลิกเพื่อดู)", expanded=True):
+                st.error(f"เปิดแผ่นงาน '{title}' ไม่สำเร็จ (โควต้าอ่านเกินชั่วคราว)")
+                st.exception(e)
+            st.stop()
+        raise
+
 @st.cache_data(ttl=90, show_spinner=False)
 def read_sheet_as_df(sheet_name: str) -> pd.DataFrame:
-    """อ่านชีตเป็น DataFrame (cache 90s) — ไม่รับ ss เพื่อหลีกเลี่ยง UnhashableParamError"""
+    """อ่านชีตเป็น DataFrame (cache 90s)"""
     _, ss = get_client_and_ss()
-    ws = ss.worksheet(sheet_name)
-    vals = ws.get_all_values()
+    ws = get_or_create_ws(ss, sheet_name, 1000, 26)
+    vals = with_retry(ws.get_all_values)
+    vals = vals()
     return pd.DataFrame(vals[1:], columns=vals[0]) if vals else pd.DataFrame()
 
 # ----------------- App -----------------
@@ -162,18 +215,7 @@ def main():
     except Exception:
         pass
 
-    # ---- เปิดเฉพาะชีตที่ต้องใช้ (ไม่ list ทั้งไฟล์) ----
-    def get_or_create_ws(_ss, title: str, rows: int = 1000, cols: int = 26):
-        try:
-            return _ss.worksheet(title)
-        except WorksheetNotFound:
-            return _ss.add_worksheet(title, rows, cols)
-        except Exception as e:
-            with st.expander("รายละเอียดการเชื่อมต่อ / ข้อผิดพลาด (คลิกเพื่อดู)", expanded=True):
-                st.error(f"เปิดแผ่นงาน '{title}' ไม่สำเร็จ")
-                st.exception(e)
-            st.stop()
-
+    # เปิดเฉพาะชีตที่ต้องใช้ (ผ่าน mapping + retry)
     ws_users = get_or_create_ws(ss, "Users",         1000, 26)
     ws_items = get_or_create_ws(ss, "Items",         2000, 26)
     ws_reqs  = get_or_create_ws(ss, "Requests",      2000, 26)
@@ -245,27 +287,6 @@ def main():
 
     name_display = dfi[c_name].astype(str).str.strip() if c_name else pd.Series([""]*len(dfi))
 
-    # (ทางเลือก) เติมชื่อจากชีต Catalog (ถ้ามี) — ไม่ list ชีตทั้งหมด
-    for cat in ("Catalog", "Catalogs", "ItemMaster", "Master"):
-        try:
-            dfm = read_sheet_as_df(cat)
-        except Exception:
-            dfm = pd.DataFrame()
-        if dfm.empty: 
-            continue
-        m_code = find_col_fuzzy(dfm, {"รหัส","itemcode","code","sku","part","partno","partnumber"})
-        m_name = find_col_fuzzy(dfm, {"ชื่อ","ชื่ออุปกรณ์","ชื่อสินค้า","name","รายการ","description","desc"})
-        if m_code and m_name:
-            mp = {str(r[m_code]).strip(): str(r[m_name]).strip()
-                  for _, r in dfm.iterrows() if str(r[m_code]).strip()}
-            for idx, row in dfi.iterrows():
-                if not name_display.iloc[idx]:
-                    code = str(row[c_code]).strip()
-                    if code in mp:
-                        name_display.iloc[idx] = mp[code]
-            if not name_display.eq("").any():
-                break
-
     c_qty   = find_col_fuzzy(dfi, {"คงเหลือ","qty","จำนวน","stock","balance","remaining","remain","จำนวนคงเหลือ"})
     c_ready = find_col_fuzzy(dfi, {
         "พร้อมให้เบิก","พร้อมให้เบิก(y/n)","ready","available",
@@ -336,7 +357,7 @@ def main():
                 r["รหัส"], r["ชื่อ"], str(int(r["จำนวนที่ต้องการ"])),
                 "pending", "", ts, "", "N", "N",
             ]
-            ws_reqs.append_row(row, value_input_option="USER_ENTERED")
+            with_retry(ws_reqs.append_row, row, value_input_option="USER_ENTERED")
 
         n_headers = ws_noti.row_values(1)
         noti = {
@@ -350,7 +371,7 @@ def main():
             "ReadFlag": "N",
             "ReadAt": "",
         }
-        ws_noti.append_row([noti.get(h,"") for h in n_headers], value_input_option="USER_ENTERED")
+        with_retry(ws_noti.append_row, [noti.get(h,"") for h in n_headers], value_input_option="USER_ENTERED")
 
         # เคลียร์ cache อ่านชีต → หน้า History จะเห็นออเดอร์ใหม่ทันที
         st.cache_data.clear()
