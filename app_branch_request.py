@@ -4,7 +4,7 @@ from datetime import datetime, timezone, timedelta
 import pandas as pd
 import streamlit as st
 
-BUILD_TAG = "diag-2025-08-30-A"  # ใช้ตรวจว่าไฟล์ใหม่นี้รันอยู่จริง
+BUILD_TAG = "diag-2025-08-30-B"  # new build tag
 APP_TITLE = f"WishCo Branch Portal — เบิกอุปกรณ์ ({BUILD_TAG})"
 TIMEZONE = timezone(timedelta(hours=7))
 
@@ -19,37 +19,59 @@ def show_secrets_status():
     st.sidebar.subheader("Secrets status")
     st.sidebar.write("keys:", keys)
     if "gcp_service_account" in st.secrets:
-        d = dict(st.secrets["gcp_service_account"])
-        # ซ่อนรายละเอียด key แต่แสดงว่าเป็นหลายบรรทัด
+        try:
+            d = dict(st.secrets["gcp_service_account"])
+        except Exception:
+            d = {"_raw_type": str(type(st.secrets["gcp_service_account"]))}
         prv = d.get("private_key","")
-        preview = prv.splitlines()[:2] + ["..."] + prv.splitlines()[-2:] if prv else []
+        preview = prv.splitlines()[:2] + ["..."] + prv.splitlines()[-2:] if isinstance(prv, str) and prv else []
         d_preview = {k: ("<hidden>" if "key" in k and k!="private_key" else v) for k,v in d.items() if k!="private_key"}
         st.sidebar.write("gcp_service_account:", d_preview)
-        st.sidebar.code("\n".join(preview) if preview else "(no private_key)", language="text")
+        if preview:
+            st.sidebar.code("\n".join(preview), language="text")
+        else:
+            st.sidebar.code("(no private_key)", language="text")
 
 def load_credentials():
     from google.oauth2.service_account import Credentials
     scope = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
-    if "gcp_service_account" in st.secrets and isinstance(st.secrets["gcp_service_account"], dict):
-        st.sidebar.success("using [gcp_service_account]")
-        return Credentials.from_service_account_info(dict(st.secrets["gcp_service_account"]), scopes=scope)
+    # 1) Use mapping under gcp_service_account (coerce to dict)
+    if "gcp_service_account" in st.secrets:
+        try:
+            info = dict(st.secrets["gcp_service_account"])
+            return Credentials.from_service_account_info(info, scopes=scope)
+        except Exception as e:
+            st.error(f"gcp_service_account มีแต่สร้าง Credentials ไม่ได้: {e}")
+            st.stop()
+    # 2) top-level keys
     req = {"type","project_id","private_key_id","private_key","client_email","client_id"}
     if req.issubset(set(st.secrets.keys())):
-        st.sidebar.success("using top-level keys")
-        info = {k: st.secrets[k] for k in req}
-        info.setdefault("auth_uri","https://accounts.google.com/o/oauth2/auth")
-        info.setdefault("token_uri","https://oauth2.googleapis.com/token")
-        info.setdefault("auth_provider_x509_cert_url","https://www.googleapis.com/oauth2/v1/certs")
-        info.setdefault("client_x509_cert_url","")
-        return Credentials.from_service_account_info(info, scopes=scope)
+        try:
+            info = {k: st.secrets[k] for k in req}
+            info.setdefault("auth_uri","https://accounts.google.com/o/oauth2/auth")
+            info.setdefault("token_uri","https://oauth2.googleapis.com/token")
+            info.setdefault("auth_provider_x509_cert_url","https://www.googleapis.com/oauth2/v1/certs")
+            info.setdefault("client_x509_cert_url","")
+            return Credentials.from_service_account_info(info, scopes=scope)
+        except Exception as e:
+            st.error(f"top-level keys พบแต่สร้าง Credentials ไม่ได้: {e}")
+            st.stop()
+    # 3) JSON string
     s = st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON","").strip()
     if s:
-        st.sidebar.success("using GOOGLE_SERVICE_ACCOUNT_JSON")
-        return Credentials.from_service_account_info(json.loads(s), scopes=scope)
+        try:
+            return Credentials.from_service_account_info(json.loads(s), scopes=scope)
+        except Exception as e:
+            st.error(f"GOOGLE_SERVICE_ACCOUNT_JSON ไม่ใช่ JSON ที่ถูกต้อง: {e}")
+            st.stop()
+    # 4) file path
     p = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS","").strip()
     if p and os.path.exists(p):
-        st.sidebar.success(f"using file: {p}")
-        return Credentials.from_service_account_file(p, scopes=scope)
+        try:
+            return Credentials.from_service_account_file(p, scopes=scope)
+        except Exception as e:
+            st.error(f"GOOGLE_APPLICATION_CREDENTIALS ใช้ไม่ได้: {e}")
+            st.stop()
     st.error("ไม่พบ Service Account ใน Secrets"); st.stop()
 
 def open_sheet(client):
