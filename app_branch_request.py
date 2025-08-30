@@ -1,17 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-Branch Portal (Streamlit + Google Sheets) — CloudSafe Variant
-- รองรับ 3 รูปแบบ secrets:
-  1) st.secrets["gcp_service_account"] เป็น dict (แนะนำที่สุดบน Streamlit Cloud)
-  2) st.secrets["service_account"] เป็น dict
-  3) GOOGLE_SERVICE_ACCOUNT_JSON เป็นสตริง JSON
+Branch Portal — CloudSafe AutoURL
+- ไม่ต้องตั้ง SHEET_ID/SHEET_URL ใน Secrets ก็ได้
+- ถ้าไม่มีค่า จะให้กรอก Sheet URL บนหน้าเว็บ แล้วเปิดใช้งานได้ทันที
+- ใช้ st.secrets ในรูปแบบ table [gcp_service_account] เป็นหลัก
 """
 import os, json
 from datetime import datetime, timezone, timedelta
 import pandas as pd
 import streamlit as st
 
-# auto-load st.secrets into env strings for backward compatibility
+# auto-load secrets to env (optional)
 try:
     for _k, _v in st.secrets.items():
         if isinstance(_v, (dict, list)):
@@ -24,14 +23,15 @@ except Exception:
 try:
     import gspread
     from google.oauth2.service_account import Credentials
-except Exception as e:
-    st.error("ต้องติดตั้ง gspread และ google-auth")
-    st.stop()
+except Exception:
+    st.error("ต้องติดตั้ง gspread และ google-auth"); st.stop()
 
 APP_TITLE = "WishCo Branch Portal — เบิกอุปกรณ์"
 TIMEZONE = timezone(timedelta(hours=7))
+
 SHEET_ID = os.environ.get("SHEET_ID", "").strip()
 SHEET_URL = os.environ.get("SHEET_URL", "").strip()
+
 SHEET_USERS = os.environ.get("SHEET_USERS", "Users")
 SHEET_ITEMS = os.environ.get("SHEET_ITEMS", "Items")
 SHEET_REQUESTS = os.environ.get("SHEET_REQUESTS", "Requests")
@@ -46,45 +46,46 @@ NOTI_REQ_CREATED, NOTI_ITEM_ISSUED = "REQ_CREATED","ITEM_ISSUED"
 def _now_str(): return datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
 
 def _load_credentials():
-    # 1) Preferred: secrets table (dict) — avoids JSON string errors
-    for k in ("gcp_service_account", "service_account", "GOOGLE_SERVICE_ACCOUNT_JSON"):
-        if k in st.secrets:
-            val = st.secrets[k]
-            if isinstance(val, dict):
-                scope = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
-                return Credentials.from_service_account_info(dict(val), scopes=scope)
-            # if it's a string, try to json.loads
-            if isinstance(val, str) and val.strip():
-                try:
-                    info = json.loads(val)
-                    scope = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
-                    return Credentials.from_service_account_info(info, scopes=scope)
-                except Exception:
-                    st.error("ค่า GOOGLE_SERVICE_ACCOUNT_JSON ใน Secrets ไม่ใช่ JSON ที่ถูกต้อง (ลองใช้รูปแบบ [gcp_service_account] แทน)")
-                    return None
-    # 2) Fallback: env var JSON
-    s = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON","").strip()
+    # prefer table in secrets
+    if "gcp_service_account" in st.secrets and isinstance(st.secrets["gcp_service_account"], dict):
+        scope = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
+        return Credentials.from_service_account_info(dict(st.secrets["gcp_service_account"]), scopes=scope)
+    # fallback JSON string
+    s = st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON", os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON","")).strip()
     if s:
         try:
             info = json.loads(s)
             scope = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
             return Credentials.from_service_account_info(info, scopes=scope)
         except Exception:
-            st.error("GOOGLE_SERVICE_ACCOUNT_JSON ไม่ใช่ JSON ที่ถูกต้อง")
-            return None
-    # 3) Fallback: file path
+            st.error("GOOGLE_SERVICE_ACCOUNT_JSON ไม่ใช่ JSON ที่ถูกต้อง"); return None
+    # fallback file path
     p = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS","").strip()
     if p and os.path.exists(p):
         scope = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
         return Credentials.from_service_account_file(p, scopes=scope)
-    st.error("ไม่พบ Service Account (ตั้งค่า secrets แบบ [gcp_service_account] แนะนำ)")
-    return None
+    st.error("ไม่พบ Service Account ใน Secrets"); return None
 
 def _open_spreadsheet(client):
+    # 1) env provided
     if SHEET_ID: return client.open_by_key(SHEET_ID)
     if SHEET_URL: return client.open_by_url(SHEET_URL)
-    st.error("โปรดตั้งค่า SHEET_ID หรือ SHEET_URL")
-    return None
+    # 2) session prompt
+    st.warning("ยังไม่ตั้งค่า SHEET_ID/SHEET_URL — โปรดวางลิงก์ Google Sheet ที่ใช้ร่วมกับแอปเดิม")
+    default = st.session_state.get("input_sheet_url","")
+    url = st.text_input("วาง URL ของไฟล์ Google Sheet (เริ่มต้นด้วย https://docs.google.com/spreadsheets/d/...)", value=default)
+    if st.button("เชื่อมต่อชีตจาก URL", type="primary"):
+        if not url.strip():
+            st.error("กรุณาวาง URL ของชีต"); st.stop()
+        st.session_state["input_sheet_url"] = url.strip()
+        try:
+            ss = client.open_by_url(url.strip())
+            st.success("เชื่อมต่อชีตสำเร็จ")
+            return ss
+        except Exception as e:
+            st.error(f"เปิดชีตไม่สำเร็จ: {e}")
+            st.stop()
+    st.stop()
 
 def _ensure_worksheet(ss, name, headers):
     try:
@@ -140,8 +141,8 @@ def do_login():
         cb = _find_col(users, {"branch","สาขา","branchcode","BranchCode"})
         if not all([cu,cp,cb]): st.error("Users sheet ไม่ครบคอลัมน์ที่จำเป็น"); return
         row = users[users[cu]==u].head(1)
-        if row.empty: st.error("ไม่พบผู้ใช้หรือรหัสผ่านไม่ถูกต้อง"); return
-        if not verify_password(p, str(row.iloc[0][cp])): st.error("ไม่พบผู้ใช้หรือรหัสผ่านไม่ถูกต้อง"); return
+        if row.empty or not verify_password(p, str(row.iloc[0][cp])):
+            st.error("ไม่พบผู้ใช้หรือรหัสผ่านไม่ถูกต้อง"); return
         role = str(row.iloc[0][cr]) if cr else "branch"
         if role and role.lower() not in {"branch","user","staff","สาขา"}:
             st.error("บัญชีนี้ไม่ได้กำหนดบทบาทสำหรับสาขา"); return
@@ -167,8 +168,7 @@ def page_stock():
     c_name = _find_col(items, {"ชื่อ","รายการ","ItemName","Name","ชื่ออุปกรณ์"})
     c_qty  = _find_col(items, {"คงเหลือ","จำนวนคงเหลือ","Stock","Qty","จำนวน"})
     c_ready= _find_col(items, {"พร้อมให้เบิก","พร้อมให้เบิก(Y/N)","Available","Ready","พร้อม"})
-    if not all([c_code,c_name,c_qty]):
-        st.error("Items sheet ต้องมี รหัส/ชื่อ/คงเหลือ"); return
+    if not all([c_code,c_name,c_qty]): st.error("Items sheet ต้องมี รหัส/ชื่อ/คงเหลือ"); return
     df = items[[c_code,c_name,c_qty] + ([c_ready] if c_ready else [])].copy()
     df.rename(columns={c_code:"รหัส",c_name:"ชื่อ",c_qty:"คงเหลือ"}, inplace=True)
     if c_ready: df.rename(columns={c_ready:"พร้อมให้เบิก"}, inplace=True)
@@ -193,7 +193,6 @@ def page_create_request():
         except Exception: q=r["qty"]
         return f"{r['code']} | {r['name']} (คงเหลือ {q})"
     df["label"]=df.apply(label, axis=1)
-    st.write("เพิ่มรายการที่ต้องการเบิก (เลือกอุปกรณ์ + ระบุจำนวน)")
     data = pd.DataFrame([{"อุปกรณ์":"","จำนวน":1,"หมายเหตุ":""} for _ in range(5)])
     edited = st.data_editor(data, num_rows="dynamic", use_container_width=True,
                             column_config={
@@ -242,6 +241,7 @@ def main():
     client = gspread.authorize(creds)
     ss = _open_spreadsheet(client)
     if ss is None: st.stop()
+
     ws_users = _ensure_worksheet(ss, SHEET_USERS, ["username","password","role","BranchCode"])
     ws_items = _ensure_worksheet(ss, SHEET_ITEMS, ["รหัส","ชื่อ","คงเหลือ","พร้อมให้เบิก(Y/N)"])
     ws_requests = _ensure_worksheet(ss, SHEET_REQUESTS, [
@@ -260,7 +260,7 @@ def main():
             st.session_state["auth"]=False; st.session_state["user"]=None; st.cache_data.clear(); st.experimental_rerun()
 
     tab = st.sidebar.radio("เมนู", ["🔔 การแจ้งเตือน","🧾 สร้างคำขอ","📮 คำขอของฉัน","📦 คลังสำหรับสาขา"], index=0)
-    if tab.startswith("🔔"): st.write("ยังไม่มีแจ้งเตือนใหม่ในเฟสนี้");  # viewer only (ฝั่ง main จะเขียนกลับในเฟส 2)
+    if tab.startswith("🔔"): st.write("ยังไม่มีแจ้งเตือนใหม่ในเฟสนี้")
     elif tab.startswith("🧾"): page_create_request()
     elif tab.startswith("📮"): page_my_requests()
     else: page_stock()
