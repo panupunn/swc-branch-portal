@@ -1,316 +1,168 @@
 # -*- coding: utf-8 -*-
-"""
-WishCo Branch Portal — Resilient Secrets Edition
-- ยอมรับ Secrets ได้หลายรูปแบบ (กันพลาด)
-  1) [gcp_service_account]  (TOML table)  ✅ แนะนำ
-  2) [service_account]      (TOML table)
-  3) คีย์ service account วาง "บนสุด" ของ Secrets (top-level keys)
-     เช่น client_id, client_email, private_key (รองรับ private_key ทั้งแบบบรรทัดเดียวและ triple quotes)
-  4) GOOGLE_SERVICE_ACCOUNT_JSON (สตริง JSON)
-  5) GOOGLE_APPLICATION_CREDENTIALS (พา ธ ไปยังไฟล์ .json)
-- ถ้าไม่ตั้ง SHEET_ID/SHEET_URL จะแสดงช่องกรอก URL บนหน้าแอป (AutoURL)
-"""
-import os, json, sys
+import os, json
 from datetime import datetime, timezone, timedelta
 import pandas as pd
 import streamlit as st
 
-# ------------------------------------------------------------
-# Optional debug: แสดงว่าเห็นคีย์อะไรใน st.secrets
-# เปิด/ปิดด้วยคิวรี่สตริง ?debug=1
-# ------------------------------------------------------------
-_DEBUG = st.query_params.get("debug", ["0"])[0] in ("1", "true", "yes")
-
-def _debug(msg):
-    if _DEBUG:
-        st.sidebar.info(msg)
-
-# auto-load secrets into env (เผื่อบางไลบรารีไปอ่านจาก env)
-try:
-    for _k, _v in st.secrets.items():
-        if isinstance(_v, (dict, list)):
-            os.environ.setdefault(_k, json.dumps(_v, ensure_ascii=False))
-        else:
-            os.environ.setdefault(_k, str(_v))
-except Exception:
-    pass
-
-try:
-    import gspread
-    from google.oauth2.service_account import Credentials
-except Exception:
-    st.error("ต้องติดตั้ง gspread และ google-auth"); st.stop()
-
 APP_TITLE = "WishCo Branch Portal — เบิกอุปกรณ์"
 TIMEZONE = timezone(timedelta(hours=7))
 
-# อ่านค่า SHEET_* จาก env หรือ secrets
-SHEET_ID = os.environ.get("SHEET_ID", st.secrets.get("SHEET_ID", "")).strip()
-SHEET_URL = os.environ.get("SHEET_URL", st.secrets.get("SHEET_URL", "")).strip()
+# ===== Helpers =====
+def _now(): return datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
 
-SHEET_USERS = os.environ.get("SHEET_USERS", st.secrets.get("SHEET_USERS", "Users"))
-SHEET_ITEMS = os.environ.get("SHEET_ITEMS", st.secrets.get("SHEET_ITEMS", "Items"))
-SHEET_REQUESTS = os.environ.get("SHEET_REQUESTS", st.secrets.get("SHEET_REQUESTS", "Requests"))
-SHEET_NOTI = os.environ.get("SHEET_NOTIFICATIONS", st.secrets.get("SHEET_NOTIFICATIONS", "Notifications"))
-SHEET_SETTINGS = os.environ.get("SHEET_SETTINGS", st.secrets.get("SHEET_SETTINGS", "Settings"))
+def _debug_on(): 
+    qp = st.query_params
+    return (qp.get("debug", ["0"])[0] in ("1","true","yes"))
 
-VISIBLE_AVAILABLE_ONLY = "AVAILABLE_ONLY"
-VISIBLE_ALL_WITH_FLAG = "ALL_WITH_FLAG"
-STATUS_PENDING, STATUS_ISSUED, STATUS_RECEIVED = "PENDING","ISSUED","RECEIVED"
-NOTI_REQ_CREATED, NOTI_ITEM_ISSUED = "REQ_CREATED","ITEM_ISSUED"
-
-def _now_str(): return datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
-
-def _try_build_info_from_top_level(keys):
-    """ลองสร้าง dict service account จากคีย์บนสุดของ st.secrets (กรณีผู้ใช้วางคีย์แบบ top-level)"""
-    req = ("type","project_id","private_key_id","private_key","client_email","client_id")
-    if not all(k in keys for k in req):
-        return None
-    # ใช้ค่าโดยตรง
-    info = {k: st.secrets[k] for k in keys}
-    # เติมค่าเริ่มต้นให้คีย์ที่อาจหายไป
-    info.setdefault("type", "service_account")
-    info.setdefault("auth_uri", "https://accounts.google.com/o/oauth2/auth")
-    info.setdefault("token_uri", "https://oauth2.googleapis.com/token")
-    info.setdefault("auth_provider_x509_cert_url", "https://www.googleapis.com/oauth2/v1/certs")
-    info.setdefault("client_x509_cert_url", "")
-    return info
+def _secrets_keys():
+    try:
+        return list(st.secrets.keys())
+    except Exception:
+        return []
 
 def _load_credentials():
-    # 1) รูปแบบ table: [gcp_service_account] / [service_account]
-    for name in ("gcp_service_account", "service_account"):
-        if name in st.secrets and isinstance(st.secrets[name], dict):
-            _debug(f"ใช้ secrets แบบ table: [{name}]")
-            scope = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
-            return Credentials.from_service_account_info(dict(st.secrets[name]), scopes=scope)
+    try:
+        from google.oauth2.service_account import Credentials
+    except Exception:
+        st.error("ต้องติดตั้ง gspread และ google-auth (ดู requirements.txt)"); st.stop()
 
-    # 2) top-level keys (ผู้ใช้วางคีย์ไว้บนสุด)
-    top_keys = set(st.secrets.keys())
-    info = _try_build_info_from_top_level(top_keys)
-    if info:
-        _debug("ใช้ secrets แบบ top-level keys")
-        scope = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
+    # 1) table: [gcp_service_account] หรือ [service_account]
+    for k in ("gcp_service_account", "service_account"):
+        if k in st.secrets and isinstance(st.secrets[k], dict):
+            info = dict(st.secrets[k])
+            scope = ["https://www.googleapis.com/auth/spreadsheets",
+                     "https://www.googleapis.com/auth/drive"]
+            return Credentials.from_service_account_info(info, scopes=scope)
+
+    # 2) top-level keys (วางคีย์บนสุด)
+    required = {"type","project_id","private_key_id","private_key","client_email","client_id"}
+    if required.issubset(set(_secrets_keys())):
+        info = {k: st.secrets[k] for k in required}
+        info["auth_uri"]  = st.secrets.get("auth_uri","https://accounts.google.com/o/oauth2/auth")
+        info["token_uri"] = st.secrets.get("token_uri","https://oauth2.googleapis.com/token")
+        info["auth_provider_x509_cert_url"] = st.secrets.get("auth_provider_x509_cert_url","https://www.googleapis.com/oauth2/v1/certs")
+        info["client_x509_cert_url"] = st.secrets.get("client_x509_cert_url","")
+        scope = ["https://www.googleapis.com/auth/spreadsheets",
+                 "https://www.googleapis.com/auth/drive"]
         return Credentials.from_service_account_info(info, scopes=scope)
 
     # 3) JSON string
-    s = st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON", os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON","")).strip()
+    s = st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
     if s:
         try:
             info = json.loads(s)
-            _debug("ใช้ GOOGLE_SERVICE_ACCOUNT_JSON")
-            scope = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
+            scope = ["https://www.googleapis.com/auth/spreadsheets",
+                     "https://www.googleapis.com/auth/drive"]
             return Credentials.from_service_account_info(info, scopes=scope)
-        except Exception as e:
-            st.error("GOOGLE_SERVICE_ACCOUNT_JSON ไม่ใช่ JSON ที่ถูกต้อง"); return None
+        except Exception:
+            st.error("GOOGLE_SERVICE_ACCOUNT_JSON ไม่ใช่ JSON ที่ถูกต้อง"); st.stop()
 
     # 4) file path
     p = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS","").strip()
     if p and os.path.exists(p):
-        _debug(f"ใช้ไฟล์ credentials: {p}")
-        scope = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
+        scope = ["https://www.googleapis.com/auth/spreadsheets",
+                 "https://www.googleapis.com/auth/drive"]
         return Credentials.from_service_account_file(p, scopes=scope)
 
-    # 5) ไม่พบอะไรเลย
     st.error("ไม่พบ Service Account ใน Secrets")
-    if _DEBUG:
-        st.sidebar.write("Secrets keys:", list(st.secrets.keys()))
-    return None
+    if _debug_on(): st.sidebar.write("Secrets keys:", _secrets_keys())
+    st.stop()
 
 def _open_spreadsheet(client):
-    if SHEET_ID: return client.open_by_key(SHEET_ID)
-    if SHEET_URL: return client.open_by_url(SHEET_URL)
+    SHEET_ID  = st.secrets.get("SHEET_ID","").strip() or os.environ.get("SHEET_ID","").strip()
+    SHEET_URL = st.secrets.get("SHEET_URL","").strip() or os.environ.get("SHEET_URL","").strip()
+    if SHEET_ID: 
+        return client.open_by_key(SHEET_ID)
+    if SHEET_URL:
+        return client.open_by_url(SHEET_URL)
 
-    # AutoURL: ให้กรอก URL บนหน้าเว็บ
-    st.warning("ยังไม่ตั้งค่า SHEET_ID/SHEET_URL — โปรดวางลิงก์ Google Sheet ที่ใช้ร่วมกับแอปเดิม")
-    default = st.session_state.get("input_sheet_url","")
-    url = st.text_input("วาง URL ของไฟล์ Google Sheet (เริ่มต้นด้วย https://docs.google.com/spreadsheets/d/...)", value=default)
+    # AutoURL: ให้ผู้ใช้วางลิงก์บนหน้าแรก
+    st.info("ยังไม่ตั้งค่า SHEET_ID/SHEET_URL — วางลิงก์ Google Sheet ด้านล่างเพื่อเชื่อมต่อ")
+    url = st.text_input("วาง URL ของ Google Sheet (เริ่มด้วย https://docs.google.com/spreadsheets/...)",
+                        value=st.session_state.get("input_sheet_url",""))
     if st.button("เชื่อมต่อชีตจาก URL", type="primary"):
         if not url.strip():
-            st.error("กรุณาวาง URL ของชีต"); st.stop()
+            st.warning("กรุณาวาง URL"); st.stop()
         st.session_state["input_sheet_url"] = url.strip()
         try:
-            ss = client.open_by_url(url.strip()); st.success("เชื่อมต่อชีตสำเร็จ"); return ss
+            return client.open_by_url(url.strip())
         except Exception as e:
             st.error(f"เปิดชีตไม่สำเร็จ: {e}"); st.stop()
     st.stop()
 
-def _ensure_worksheet(ss, name, headers):
-    try:
-        ws = ss.worksheet(name)
-    except Exception:
-        ws = ss.add_worksheet(title=name, rows=1000, cols=50); ws.append_row(headers); return ws
+def _ensure(ws, headers):
     first = ws.row_values(1) or []
-    missing = [h for h in headers if h not in first]
     if not first: ws.update("A1", [headers])
-    elif missing: ws.update("A1", [first + missing])
-    return ws
+    else:
+        missing = [h for h in headers if h not in first]
+        if missing: ws.update("A1", [first + missing])
 
-def _worksheet_to_df(ws):
+def _to_df(ws):
     vals = ws.get_all_values()
-    if not vals: return pd.DataFrame()
-    return pd.DataFrame(vals[1:], columns=vals[0])
+    return pd.DataFrame(vals[1:], columns=vals[0]) if vals else pd.DataFrame()
 
-def _find_col(df, candidates:set):
+def _find_col(df, names:set):
     for c in df.columns:
-        if c.strip() in candidates or c.strip().lower() in {x.lower() for x in candidates}:
-            return c
+        if c.strip() in names or c.strip().lower() in {x.lower() for x in names}: return c
     return None
 
-@st.cache_data(ttl=15) 
-def load_settings_df(): return _worksheet_to_df(st.session_state["ws_settings"])
-@st.cache_data(ttl=15) 
-def load_items_df(): return _worksheet_to_df(st.session_state["ws_items"])
-@st.cache_data(ttl=15) 
-def load_users_df(): return _worksheet_to_df(st.session_state["ws_users"])
-@st.cache_data(ttl=10) 
-def load_requests_df(): return _worksheet_to_df(st.session_state["ws_requests"])
-@st.cache_data(ttl=10) 
-def load_notifications_df(): return _worksheet_to_df(st.session_state["ws_noti"])
-
-def verify_password(plain, hashed):
-    if not hashed: return False
-    try:
-        import bcrypt
-        if hashed.startswith("$2"): return bcrypt.checkpw(plain.encode(), hashed.encode())
-    except Exception: pass
-    return plain == hashed
-
-def do_login():
-    st.sidebar.subheader("เข้าสู่ระบบสำหรับสาขา/หน่วยงาน")
-    u = st.sidebar.text_input("ชื่อผู้ใช้")
-    p = st.sidebar.text_input("รหัสผ่าน", type="password")
-    if st.sidebar.button("ล็อกอิน", use_container_width=True):
-        users = load_users_df()
-        cu = _find_col(users, {"username","user","บัญชีผู้ใช้"})
-        cp = _find_col(users, {"password","รหัสผ่าน"})
-        cr = _find_col(users, {"role","บทบาท"})
-        cb = _find_col(users, {"branch","สาขา","branchcode","BranchCode"})
-        if not all([cu,cp,cb]): st.error("Users sheet ไม่ครบคอลัมน์ที่จำเป็น"); return
-        row = users[users[cu]==u].head(1)
-        if row.empty or not verify_password(p, str(row.iloc[0][cp])):
-            st.error("ไม่พบผู้ใช้หรือรหัสผ่านไม่ถูกต้อง"); return
-        role = str(row.iloc[0][cr]) if cr else "branch"
-        if role and role.lower() not in {"branch","user","staff","สาขา"}:
-            st.error("บัญชีนี้ไม่ได้กำหนดบทบาทสำหรับสาขา"); return
-        st.session_state["auth"]=True
-        st.session_state["user"]={"username":u,"role":role or "branch","branch":str(row.iloc[0][cb])}
-        st.success(f"ยินดีต้อนรับ {u}")
-
-def get_branch_visible_mode():
-    df = load_settings_df()
-    if df.empty: return VISIBLE_AVAILABLE_ONLY
-    key_col = "key" if "key" in df.columns else ("Key" if "Key" in df.columns else None)
-    val_col = "value" if "value" in df.columns else ("Value" if "Value" in df.columns else None)
-    if not key_col or not val_col: return VISIBLE_AVAILABLE_ONLY
-    hit = df[df[key_col]=="branch_visible_mode"]
-    mode = str(hit.iloc[0][val_col]).strip().upper() if not hit.empty else VISIBLE_AVAILABLE_ONLY
-    return mode if mode in {VISIBLE_AVAILABLE_ONLY, VISIBLE_ALL_WITH_FLAG} else VISIBLE_AVAILABLE_ONLY
-
-def page_stock():
-    st.header("📦 คลังสำหรับสาขา")
-    items = load_items_df()
-    if items.empty: st.info("ยังไม่มีข้อมูล"); return
-    c_code = _find_col(items, {"รหัส","รหัสวัสดุ","ItemCode","Code","รหัสอุปกรณ์"})
-    c_name = _find_col(items, {"ชื่อ","รายการ","ItemName","Name","ชื่ออุปกรณ์"})
-    c_qty  = _find_col(items, {"คงเหลือ","จำนวนคงเหลือ","Stock","Qty","จำนวน"})
-    c_ready= _find_col(items, {"พร้อมให้เบิก","พร้อมให้เบิก(Y/N)","Available","Ready","พร้อม"})
-    if not all([c_code,c_name,c_qty]): st.error("Items sheet ต้องมี รหัส/ชื่อ/คงเหลือ"); return
-    df = items[[c_code,c_name,c_qty] + ([c_ready] if c_ready else [])].copy()
-    df.rename(columns={c_code:"รหัส",c_name:"ชื่อ",c_qty:"คงเหลือ"}, inplace=True)
-    if c_ready: df.rename(columns={c_ready:"พร้อมให้เบิก"}, inplace=True)
-    else: df["พร้อมให้เบิก"] = ""
-    mode = get_branch_visible_mode()
-    if mode==VISIBLE_AVAILABLE_ONLY:
-        df = df[(df["พร้อมให้เบิก"].str.upper()=="Y") | (df["พร้อมให้เบิก"].str.upper()=="YES")]
-    else:
-        df["สถานะ"] = df["พร้อมให้เบิก"].apply(lambda x: "✅ พร้อม" if str(x).upper() in {"Y","YES","TRUE","1"} else "🚫 ไม่พร้อม")
-    st.dataframe(df, use_container_width=True)
-
-def page_create_request():
-    st.header("🧾 สร้างคำขอเบิกอุปกรณ์")
-    items = load_items_df()
-    if items.empty: st.info("ยังไม่มีข้อมูล"); return
-    c_code = _find_col(items, {"รหัส","รหัสวัสดุ","ItemCode","Code","รหัสอุปกรณ์"})
-    c_name = _find_col(items, {"ชื่อ","รายการ","ItemName","Name","ชื่ออุปกรณ์"})
-    c_qty  = _find_col(items, {"คงเหลือ","จำนวนคงเหลือ","Stock","Qty","จำนวน"})
-    df = items[[c_code,c_name,c_qty]].copy(); df.columns=["code","name","qty"]
-    def label(r):
-        try: q=int(float(r["qty"]))
-        except Exception: q=r["qty"]
-        return f"{r['code']} | {r['name']} (คงเหลือ {q})"
-    df["label"]=df.apply(label, axis=1)
-    data = pd.DataFrame([{"อุปกรณ์":"","จำนวน":1,"หมายเหตุ":""} for _ in range(5)])
-    edited = st.data_editor(data, num_rows="dynamic", use_container_width=True,
-                            column_config={
-                                "อุปกรณ์": st.column_config.SelectboxColumn(options=df["label"].tolist(), required=False),
-                                "จำนวน": st.column_config.NumberColumn(min_value=1, step=1),
-                                "หมายเหตุ": st.column_config.TextColumn(),
-                            })
-    requester = st.text_input("ผู้ขอเบิก (ชื่อผู้ติดต่อ)")
-    if st.button("ส่งคำขอ", type="primary", use_container_width=True):
-        rows = edited.dropna(how="all"); rows = rows[rows["อุปกรณ์"].astype(str).str.strip()!=""]
-        if rows.empty: st.warning("กรุณาเพิ่มอย่างน้อย 1 รายการ"); return
-        req_no = make_req_no(st.session_state["user"]["branch"]); now=_now_str()
-        to_req=[]
-        for _,r in rows.iterrows():
-            item = df[df["label"]==r["อุปกรณ์"]].head(1)
-            if item.empty: continue
-            to_req.append([req_no,now,st.session_state["user"]["branch"],requester,
-                           str(item.iloc[0]["code"]), str(item.iloc[0]["name"]), int(r["จำนวน"]),
-                           STATUS_PENDING,"",now, str(r.get("หมายเหตุ","")), "N","N"])
-        st.session_state["ws_requests"].append_rows(to_req, value_input_option="USER_ENTERED")
-        st.session_state["ws_noti"].append_row([make_noti_id(), now, "main","", NOTI_REQ_CREATED, req_no,
-                                                f"มีคำขอเบิกใหม่จากสาขา {st.session_state['user']['branch']}: {req_no}", "N",""],
-                                               value_input_option="USER_ENTERED")
-        st.cache_data.clear(); st.success(f"ส่งคำขอเรียบร้อยแล้ว (เลขที่ {req_no})"); st.experimental_rerun()
-
-def page_my_requests():
-    st.header("📮 คำขอของฉัน")
-    req = load_requests_df()
-    if req.empty: st.info("ยังไม่มีคำขอ"); return
-    if "Branch" not in req.columns: st.warning("Requests sheet ไม่มีคอลัมน์ Branch"); return
-    view = req[req["Branch"]==st.session_state["user"]["branch"]].copy()
-    st.dataframe(view, use_container_width=True)
-
-def make_req_no(branch):
-    from random import randint
-    ts = datetime.now(TIMEZONE).strftime("%Y%m%d%H%M%S"); return f"{branch}-{ts}-{randint(100,999)}"
-def make_noti_id():
-    from random import randint
-    ts = datetime.now(TIMEZONE).strftime("%Y%m%d%H%M%S"); return f"NOTI-{ts}-{randint(1000,9999)}"
-
+# ===== App =====
 def main():
+    import gspread
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
 
     creds = _load_credentials()
-    if creds is None: st.stop()
     client = gspread.authorize(creds)
     ss = _open_spreadsheet(client)
-    if ss is None: st.stop()
 
-    ws_users = _ensure_worksheet(ss, SHEET_USERS, ["username","password","role","BranchCode"])
-    ws_items = _ensure_worksheet(ss, SHEET_ITEMS, ["รหัส","ชื่อ","คงเหลือ","พร้อมให้เบิก(Y/N)"])
-    ws_requests = _ensure_worksheet(ss, SHEET_REQUESTS, [
-        "ReqNo","CreatedAt","Branch","Requester","ItemCode","ItemName","Qty","Status","Approver","LastUpdate","Note","NotifiedMain(Y/N)","NotifiedBranch(Y/N)"
-    ])
-    ws_noti = _ensure_worksheet(ss, SHEET_NOTI, ["NotiID","CreatedAt","TargetApp","TargetBranch","Type","RefID","Message","ReadFlag","ReadAt"])
-    ws_settings = _ensure_worksheet(ss, SHEET_SETTINGS, ["key","value"])
-    st.session_state["ws_users"]=ws_users; st.session_state["ws_items"]=ws_items
-    st.session_state["ws_requests"]=ws_requests; st.session_state["ws_noti"]=ws_noti; st.session_state["ws_settings"]=ws_settings
+    # เตรียมชีต
+    ws_users = ss.worksheet("Users")     if "Users"     in [w.title for w in ss.worksheets()] else ss.add_worksheet("Users", 1000, 26)
+    ws_items = ss.worksheet("Items")     if "Items"     in [w.title for w in ss.worksheets()] else ss.add_worksheet("Items", 1000, 26)
+    ws_reqs  = ss.worksheet("Requests")  if "Requests"  in [w.title for w in ss.worksheets()]  else ss.add_worksheet("Requests", 1000, 26)
+    ws_noti  = ss.worksheet("Notifications") if "Notifications" in [w.title for w in ss.worksheets()] else ss.add_worksheet("Notifications", 1000, 26)
+    ws_conf  = ss.worksheet("Settings")  if "Settings"  in [w.title for w in ss.worksheets()]  else ss.add_worksheet("Settings", 1000, 26)
 
-    if not st.session_state.get("auth"): do_login(); st.stop()
-    u = st.session_state["user"]
-    with st.sidebar.expander("บัญชีของฉัน", expanded=True):
-        st.write(f"ผู้ใช้: **{u['username']}**"); st.write(f"บทบาท: **{u['role'] or 'branch'}**"); st.write(f"สาขา: **{u['branch']}**")
-        if st.button("ออกจากระบบ", use_container_width=True):
-            st.session_state["auth"]=False; st.session_state["user"]=None; st.cache_data.clear(); st.experimental_rerun()
+    _ensure(ws_users, ["username","password","role","BranchCode"])
+    _ensure(ws_items, ["รหัส","ชื่อ","คงเหลือ","พร้อมให้เบิก(Y/N)"])
+    _ensure(ws_reqs,  ["ReqNo","CreatedAt","Branch","Requester","ItemCode","ItemName","Qty",
+                       "Status","Approver","LastUpdate","Note","NotifiedMain(Y/N)","NotifiedBranch(Y/N)"])
+    _ensure(ws_noti,  ["NotiID","CreatedAt","TargetApp","TargetBranch","Type","RefID","Message","ReadFlag","ReadAt"])
+    _ensure(ws_conf,  ["key","value"])
 
-    tab = st.sidebar.radio("เมนู", ["🔔 การแจ้งเตือน","🧾 สร้างคำขอ","📮 คำขอของฉัน","📦 คลังสำหรับสาขา"], index=0)
-    if tab.startswith("🔔"): st.write("ยังไม่มีแจ้งเตือนใหม่ในเฟสนี้")
-    elif tab.startswith("🧾"): page_create_request()
-    elif tab.startswith("📮"): page_my_requests()
-    else: page_stock()
+    # Login (ขั้นต่ำ)
+    st.sidebar.subheader("เข้าสู่ระบบสำหรับสาขา/หน่วยงาน")
+    u = st.sidebar.text_input("ชื่อผู้ใช้")
+    p = st.sidebar.text_input("รหัสผ่าน", type="password")
+    if st.sidebar.button("ล็อกอิน", use_container_width=True):
+        df = _to_df(ws_users)
+        cu = _find_col(df, {"username","user","บัญชีผู้ใช้"})
+        cp = _find_col(df, {"password","รหัสผ่าน"})
+        cb = _find_col(df, {"branch","BranchCode","สาขา","branchcode"})
+        if df.empty or not all([cu,cp,cb]): st.error("Users sheet ไม่ครบคอลัมน์"); st.stop()
+        row = df[df[cu]==u].head(1)
+        if row.empty or str(row.iloc[0][cp]) != p: st.error("ไม่พบผู้ใช้หรือรหัสผ่านไม่ถูกต้อง"); st.stop()
+        st.session_state["auth"]=True; st.session_state["user"]={"username":u,"branch":str(row.iloc[0][cb])}
+        st.success(f"ยินดีต้อนรับ {u}")
+
+    if not st.session_state.get("auth"): st.stop()
+
+    # หน้า “คลัง” ให้เช็คเห็นข้อมูลได้
+    st.header("📦 คลังสำหรับสาขา")
+    items = _to_df(ws_items)
+    if items.empty:
+        st.info("ยังไม่มีข้อมูลอุปกรณ์ใน Items"); return
+    c_code = _find_col(items, {"รหัส","ItemCode","Code"})
+    c_name = _find_col(items, {"ชื่อ","Name","รายการ"})
+    c_qty  = _find_col(items, {"คงเหลือ","Qty","จำนวน"})
+    c_ready= _find_col(items, {"พร้อมให้เบิก","พร้อมให้เบิก(Y/N)","Ready"})
+    df = items[[c_code,c_name,c_qty] + ([c_ready] if c_ready else [])].copy()
+    df.rename(columns={c_code:"รหัส",c_name:"ชื่อ",c_qty:"คงเหลือ"}, inplace=True)
+    if c_ready: df.rename(columns={c_ready:"พร้อมให้เบิก"}, inplace=True)
+    st.dataframe(df, use_container_width=True)
+
+    if _debug_on():
+        st.sidebar.write("Secrets keys:", _secrets_keys())
 
 if __name__ == "__main__":
     main()
