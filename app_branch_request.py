@@ -31,6 +31,17 @@ except Exception as e:
 APP_TITLE = "WishCo Branch Portal — เบิกอุปกรณ์"
 TIMEZONE = timezone(timedelta(hours=7))  # Asia/Bangkok
 
+# ---- ใส่บล็อกนี้ก่อน "# อ่านค่า ENV" ----
+try:
+    for k, v in st.secrets.items():
+        if isinstance(v, (dict, list)):
+            os.environ.setdefault(k, json.dumps(v))
+        else:
+            os.environ.setdefault(k, str(v))
+except Exception:
+    pass
+# -------------------------------------------
+
 # อ่านค่า ENV
 SHEET_ID = os.environ.get("SHEET_ID", "").strip()
 SHEET_URL = os.environ.get("SHEET_URL", "").strip()
