@@ -14,7 +14,7 @@ import streamlit as st
 import gspread
 from gspread.exceptions import WorksheetNotFound, APIError
 
-APP_TITLE = "WishCo Branch Portal — เบิกอุปกรณ์"
+APP_TITLE = "ระบบเบิกอุปกรณ์ งานไอที"
 TZ = timezone(timedelta(hours=7))
 
 # ====================== Utilities ======================
