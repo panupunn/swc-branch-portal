@@ -1,6 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-WishCo Branch Portal — Phase 1 (Single-table, Cached, FIX UnhashableParam)
+WishCo Branch Portal — Phase 1 (Single-table, Cached, Patched)
+
+- ใช้ @st.cache_resource แคช client + spreadsheet
+- ใช้ @st.cache_data (TTL 90s) แคชการอ่านชีต; เคลียร์หลังเขียน
+- เลิกเรียก ss.worksheets() (แพง/ชนโควตา) → เปิดเฉพาะแผ่นที่ต้องใช้ด้วย try/except
+- ตารางเดียว: ติ๊กเลือก + ใส่จำนวน + ปุ่ม “เบิกอุปกรณ์ / ล้างข้อมูล”
+- สร้าง OrderNo เดียวสำหรับหลายบรรทัด, บันทึก Requests และ Notifications
 """
 
 import os, json, time, re
@@ -8,6 +14,7 @@ from datetime import datetime, timezone, timedelta
 import pandas as pd
 import streamlit as st
 import gspread
+from gspread.exceptions import WorksheetNotFound
 
 APP_TITLE = "WishCo Branch Portal — เบิกอุปกรณ์"
 TZ = timezone(timedelta(hours=7))
@@ -136,9 +143,9 @@ def get_client_and_ss():
     ss = open_spreadsheet(client)
     return client, ss
 
-@st.cache_data(ttl=45, show_spinner=False)
+@st.cache_data(ttl=90, show_spinner=False)
 def read_sheet_as_df(sheet_name: str) -> pd.DataFrame:
-    """FIX: ไม่รับ ss เป็นพารามิเตอร์ เพื่อหลีกเลี่ยง UnhashableParamError"""
+    """อ่านชีตเป็น DataFrame (cache 90s) — ไม่รับ ss เพื่อหลีกเลี่ยง UnhashableParamError"""
     _, ss = get_client_and_ss()
     ws = ss.worksheet(sheet_name)
     vals = ws.get_all_values()
@@ -155,13 +162,23 @@ def main():
     except Exception:
         pass
 
-    # สร้าง/อ้างอิงชีตหลัก
-    titles = [w.title for w in ss.worksheets()]
-    ws_users = ss.worksheet("Users") if "Users" in titles else ss.add_worksheet("Users", 1000, 26)
-    ws_items = ss.worksheet("Items") if "Items" in titles else ss.add_worksheet("Items", 2000, 26)
-    ws_reqs  = ss.worksheet("Requests") if "Requests" in titles else ss.add_worksheet("Requests", 2000, 26)
-    ws_noti  = ss.worksheet("Notifications") if "Notifications" in titles else ss.add_worksheet("Notifications", 2000, 26)
-    ws_conf  = ss.worksheet("Settings") if "Settings" in titles else ss.add_worksheet("Settings", 1000, 26)
+    # ---- เปิดเฉพาะชีตที่ต้องใช้ (ไม่ list ทั้งไฟล์) ----
+    def get_or_create_ws(_ss, title: str, rows: int = 1000, cols: int = 26):
+        try:
+            return _ss.worksheet(title)
+        except WorksheetNotFound:
+            return _ss.add_worksheet(title, rows, cols)
+        except Exception as e:
+            with st.expander("รายละเอียดการเชื่อมต่อ / ข้อผิดพลาด (คลิกเพื่อดู)", expanded=True):
+                st.error(f"เปิดแผ่นงาน '{title}' ไม่สำเร็จ")
+                st.exception(e)
+            st.stop()
+
+    ws_users = get_or_create_ws(ss, "Users",         1000, 26)
+    ws_items = get_or_create_ws(ss, "Items",         2000, 26)
+    ws_reqs  = get_or_create_ws(ss, "Requests",      2000, 26)
+    ws_noti  = get_or_create_ws(ss, "Notifications", 2000, 26)
+    ws_conf  = get_or_create_ws(ss, "Settings",      1000, 26)
 
     ensure_headers(ws_users, ["username","password","role","BranchCode"])
     ensure_headers(ws_items, ["รหัส","ชื่อ","คงเหลือ","พร้อมให้เบิก(Y/N)"])
@@ -201,7 +218,7 @@ def main():
     branch_code = st.session_state["user"]["branch"]
     username    = st.session_state["user"]["username"]
 
-    # -------- Inventory --------
+    # -------- Inventory (single table) --------
     st.header("📦 รายการอุปกรณ์ที่พร้อมให้เบิก")
 
     dfi = read_sheet_as_df("Items")
@@ -228,24 +245,26 @@ def main():
 
     name_display = dfi[c_name].astype(str).str.strip() if c_name else pd.Series([""]*len(dfi))
 
-    # เติมชื่อจากแคตตาล็อกถ้าว่าง
-    if name_display.eq("").any():
-        system_tabs = {"Users","Items","Requests","Notifications","Settings"}
-        for w in ss.worksheets():
-            if w.title in system_tabs: continue
-            dfm = read_sheet_as_df(w.title)
-            if dfm.empty: continue
-            m_code = find_col_fuzzy(dfm, {"รหัส","itemcode","code","sku","part","partno","partnumber"})
-            m_name = find_col_fuzzy(dfm, {"ชื่อ","ชื่ออุปกรณ์","ชื่อสินค้า","name","รายการ","description","desc"})
-            if m_code and m_name:
-                mp = {str(r[m_code]).strip(): str(r[m_name]).strip()
-                      for _, r in dfm.iterrows() if str(r[m_code]).strip()}
-                for idx, row in dfi.iterrows():
-                    if not name_display.iloc[idx]:
-                        code = str(row[c_code]).strip()
-                        if code in mp:
-                            name_display.iloc[idx] = mp[code]
-                if not name_display.eq("").any(): break
+    # (ทางเลือก) เติมชื่อจากชีต Catalog (ถ้ามี) — ไม่ list ชีตทั้งหมด
+    for cat in ("Catalog", "Catalogs", "ItemMaster", "Master"):
+        try:
+            dfm = read_sheet_as_df(cat)
+        except Exception:
+            dfm = pd.DataFrame()
+        if dfm.empty: 
+            continue
+        m_code = find_col_fuzzy(dfm, {"รหัส","itemcode","code","sku","part","partno","partnumber"})
+        m_name = find_col_fuzzy(dfm, {"ชื่อ","ชื่ออุปกรณ์","ชื่อสินค้า","name","รายการ","description","desc"})
+        if m_code and m_name:
+            mp = {str(r[m_code]).strip(): str(r[m_name]).strip()
+                  for _, r in dfm.iterrows() if str(r[m_code]).strip()}
+            for idx, row in dfi.iterrows():
+                if not name_display.iloc[idx]:
+                    code = str(row[c_code]).strip()
+                    if code in mp:
+                        name_display.iloc[idx] = mp[code]
+            if not name_display.eq("").any():
+                break
 
     c_qty   = find_col_fuzzy(dfi, {"คงเหลือ","qty","จำนวน","stock","balance","remaining","remain","จำนวนคงเหลือ"})
     c_ready = find_col_fuzzy(dfi, {
@@ -333,7 +352,7 @@ def main():
         }
         ws_noti.append_row([noti.get(h,"") for h in n_headers], value_input_option="USER_ENTERED")
 
-        # สำคัญ: เคลียร์ cache เพื่อให้หน้า History เห็นข้อมูลใหม่ทันที
+        # เคลียร์ cache อ่านชีต → หน้า History จะเห็นออเดอร์ใหม่ทันที
         st.cache_data.clear()
 
         with st.success(f"สร้างคำสั่งเบิกสำเร็จ: **{order_no}**"):
