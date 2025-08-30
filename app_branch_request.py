@@ -1,12 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-WishCo Branch Portal — Phase 1 (Single-table, Cached)
-
-- ป้องกันโควตาอ่านเกิน (429) ด้วย cache:
-  * @st.cache_resource สำหรับ client + spreadsheet
-  * @st.cache_data สำหรับอ่านชีต (TTL 45s) แล้ว clear หลังเขียน
-- ตารางเดียวติ๊กเลือก/ใส่จำนวน + ปุ่ม เบิกอุปกรณ์/ล้างข้อมูล
-- สร้าง OrderNo เดียวรวมหลายบรรทัด + แจ้งเตือน
+WishCo Branch Portal — Phase 1 (Single-table, Cached, FIX UnhashableParam)
 """
 
 import os, json, time, re
@@ -18,7 +12,7 @@ import gspread
 APP_TITLE = "WishCo Branch Portal — เบิกอุปกรณ์"
 TZ = timezone(timedelta(hours=7))
 
-# ------------- Utils -------------
+# ----------------- Utils -----------------
 def do_rerun():
     try: st.rerun()
     except Exception:
@@ -50,18 +44,16 @@ def find_col_fuzzy(df, keywords) -> str | None:
     headers = list(df.columns)
     norm = {h: _norm(h) for h in headers}
     kset = {_norm(k) for k in keywords}
-    # exact
     for h in headers:
         if norm[h] in kset:
             return h
-    # contains
     for h in headers:
         for k in kset:
             if k and (k in norm[h]):
                 return h
     return None
 
-# ------------- Credentials -------------
+# ----------------- Credentials -----------------
 def load_credentials():
     from google.oauth2.service_account import Credentials
     scope = ["https://www.googleapis.com/auth/spreadsheets",
@@ -124,8 +116,7 @@ def open_spreadsheet(client):
             st.stop()
 
     sid = _extract_sheet_id(raw) if raw else None
-    if sid:
-        return _try_open(sid)
+    if sid: return _try_open(sid)
 
     st.info("ยังไม่ตั้งค่า SHEET_ID / SHEET_URL — วางลิงก์หรือ Spreadsheet ID")
     inp = st.text_input("URL หรือ Spreadsheet ID", value=st.session_state.get("input_sheet_url",""))
@@ -137,7 +128,7 @@ def open_spreadsheet(client):
         return _try_open(sid2)
     st.stop()
 
-# ------------- Cached connectors & readers -------------
+# ----------------- Cached connectors & readers -----------------
 @st.cache_resource(show_spinner=False)
 def get_client_and_ss():
     creds = load_credentials()
@@ -146,13 +137,14 @@ def get_client_and_ss():
     return client, ss
 
 @st.cache_data(ttl=45, show_spinner=False)
-def read_sheet_as_df(ss, sheet_name: str) -> pd.DataFrame:
-    """อ่านชีตเป็น DataFrame (cache 45s)"""
+def read_sheet_as_df(sheet_name: str) -> pd.DataFrame:
+    """FIX: ไม่รับ ss เป็นพารามิเตอร์ เพื่อหลีกเลี่ยง UnhashableParamError"""
+    _, ss = get_client_and_ss()
     ws = ss.worksheet(sheet_name)
     vals = ws.get_all_values()
     return pd.DataFrame(vals[1:], columns=vals[0]) if vals else pd.DataFrame()
 
-# ------------- App -------------
+# ----------------- App -----------------
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
@@ -163,7 +155,7 @@ def main():
     except Exception:
         pass
 
-    # เตรียมเวิร์กชีต (ครั้งละ 1 รอบ)
+    # สร้าง/อ้างอิงชีตหลัก
     titles = [w.title for w in ss.worksheets()]
     ws_users = ss.worksheet("Users") if "Users" in titles else ss.add_worksheet("Users", 1000, 26)
     ws_items = ss.worksheet("Items") if "Items" in titles else ss.add_worksheet("Items", 2000, 26)
@@ -185,7 +177,7 @@ def main():
         u = st.sidebar.text_input("ชื่อผู้ใช้")
         p = st.sidebar.text_input("รหัสผ่าน", type="password")
         if st.sidebar.button("ล็อกอิน", use_container_width=True):
-            dfu = read_sheet_as_df(ss, "Users")
+            dfu = read_sheet_as_df("Users")
             if dfu.empty: st.sidebar.error("ไม่มีผู้ใช้ในชีต Users"); st.stop()
             cu = find_col_fuzzy(dfu, {"username","user","บัญชีผู้ใช้","ชื่อผู้ใช้"})
             cp = find_col_fuzzy(dfu, {"password","รหัสผ่าน"})
@@ -209,10 +201,10 @@ def main():
     branch_code = st.session_state["user"]["branch"]
     username    = st.session_state["user"]["username"]
 
-    # -------- Inventory (single table) --------
+    # -------- Inventory --------
     st.header("📦 รายการอุปกรณ์ที่พร้อมให้เบิก")
 
-    dfi = read_sheet_as_df(ss, "Items")
+    dfi = read_sheet_as_df("Items")
     if dfi.empty:
         st.info("ยังไม่มีข้อมูลใน Items"); st.stop()
 
@@ -220,7 +212,7 @@ def main():
     if not c_code:
         st.error("Items: หา 'รหัส' ไม่พบ"); st.stop()
 
-    # เลือกคอลัมน์ชื่อจากหลายตัวเลือกและหยิบตัวที่มีข้อมูลมากที่สุด
+    # เลือกคอลัมน์ชื่อแบบฉลาด
     name_candidates = []
     for keys in [
         {"ชื่ออุปกรณ์","ชื่อสินค้า","itemname","productname"},
@@ -236,12 +228,12 @@ def main():
 
     name_display = dfi[c_name].astype(str).str.strip() if c_name else pd.Series([""]*len(dfi))
 
-    # ดึงชื่อจากแคตตาล็อกถ้าว่าง
+    # เติมชื่อจากแคตตาล็อกถ้าว่าง
     if name_display.eq("").any():
         system_tabs = {"Users","Items","Requests","Notifications","Settings"}
         for w in ss.worksheets():
             if w.title in system_tabs: continue
-            dfm = read_sheet_as_df(ss, w.title)
+            dfm = read_sheet_as_df(w.title)
             if dfm.empty: continue
             m_code = find_col_fuzzy(dfm, {"รหัส","itemcode","code","sku","part","partno","partnumber"})
             m_name = find_col_fuzzy(dfm, {"ชื่อ","ชื่ออุปกรณ์","ชื่อสินค้า","name","รายการ","description","desc"})
@@ -255,7 +247,6 @@ def main():
                             name_display.iloc[idx] = mp[code]
                 if not name_display.eq("").any(): break
 
-    # กำหนดเงื่อนไขพร้อมให้เบิก
     c_qty   = find_col_fuzzy(dfi, {"คงเหลือ","qty","จำนวน","stock","balance","remaining","remain","จำนวนคงเหลือ"})
     c_ready = find_col_fuzzy(dfi, {
         "พร้อมให้เบิก","พร้อมให้เบิก(y/n)","ready","available",
@@ -319,28 +310,15 @@ def main():
         order_no = f"ORD-{branch_code}-{datetime.now(TZ).strftime('%Y%m%d-%H%M%S')}"
         ts = now_str()
 
-        # เขียน Requests
         for _, r in sel.iterrows():
             req_no = f"REQ-{branch_code}-{datetime.now(TZ).strftime('%Y%m%d-%H%M%S')}"
             row = [
-                req_no,               # ReqNo
-                order_no,             # OrderNo
-                ts,                   # CreatedAt
-                branch_code,          # Branch
-                username,             # Requester
-                r["รหัส"],            # ItemCode
-                r["ชื่อ"],             # ItemName
-                str(int(r["จำนวนที่ต้องการ"])),  # Qty
-                "pending",            # Status
-                "",                   # Approver
-                ts,                   # LastUpdate
-                "",                   # Note
-                "N",                  # NotifiedMain(Y/N)
-                "N",                  # NotifiedBranch(Y/N)
+                req_no, order_no, ts, branch_code, username,
+                r["รหัส"], r["ชื่อ"], str(int(r["จำนวนที่ต้องการ"])),
+                "pending", "", ts, "", "N", "N",
             ]
             ws_reqs.append_row(row, value_input_option="USER_ENTERED")
 
-        # แจ้งเตือน (Notifications)
         n_headers = ws_noti.row_values(1)
         noti = {
             "NotiID": f"NOTI-{datetime.now(TZ).strftime('%Y%m%d-%H%M%S')}",
@@ -355,7 +333,7 @@ def main():
         }
         ws_noti.append_row([noti.get(h,"") for h in n_headers], value_input_option="USER_ENTERED")
 
-        # เคลียร์ cache การอ่านชีต เพื่อให้หน้า History รีเฟรชทันที
+        # สำคัญ: เคลียร์ cache เพื่อให้หน้า History เห็นข้อมูลใหม่ทันที
         st.cache_data.clear()
 
         with st.success(f"สร้างคำสั่งเบิกสำเร็จ: **{order_no}**"):
@@ -368,7 +346,7 @@ def main():
 
     # -------- History --------
     st.markdown("### 🧾 ประวัติคำสั่งเบิก (ตามออร์เดอร์)")
-    dfr = read_sheet_as_df(ss, "Requests")
+    dfr = read_sheet_as_df("Requests")
     if not dfr.empty:
         c_branch = find_col_fuzzy(dfr, {"Branch"})
         c_user   = find_col_fuzzy(dfr, {"Requester"})
