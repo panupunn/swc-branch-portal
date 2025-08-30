@@ -1,136 +1,112 @@
 # -*- coding: utf-8 -*-
-import os, json, re
+"""
+WishCo Branch Portal — Phase 1 (Production)
+
+ฟีเจอร์ในเฟส 1:
+- เชื่อม Google Sheets ด้วย Service Account (รองรับได้หลายแบบของ Secrets)
+- ตั้งค่า SHEET_ID / SHEET_URL ใน Secrets หรือวาง URL ครั้งแรกบนหน้าเว็บ
+- หน้าล็อกอินของสาขา (อ่านจากชีต Users)
+- แสดงสต็อกและสถานะ "พร้อมให้เบิก"
+- ฟอร์ม "เบิกอุปกรณ์" สร้างรายการในชีต Requests + แจ้งเตือนใน Notifications
+- (ทางฝั่งหลักจะมาอ่านแผ่น Requests/Notifications ไปทำงานต่อในเฟสถัดไป)
+
+โครงสร้าง Worksheet ที่ใช้ (สร้างอัตโนมัติเมื่อยังไม่มี):
+- Users:        ["username","password","role","BranchCode"]
+- Items:        ["รหัส","ชื่อ","คงเหลือ","พร้อมให้เบิก(Y/N)"]
+- Requests:     ["ReqNo","CreatedAt","Branch","Requester","ItemCode","ItemName","Qty","Status","Approver","LastUpdate","Note","NotifiedMain(Y/N)","NotifiedBranch(Y/N)"]
+- Notifications: ["NotiID","CreatedAt","TargetApp","TargetBranch","Type","RefID","Message","ReadFlag","ReadAt"]
+- Settings:     ["key","value"]
+"""
+import os, json, time
 from datetime import datetime, timezone, timedelta
 import pandas as pd
 import streamlit as st
 
-BUILD_TAG = "diag-2025-08-30-C"
-APP_TITLE = f"WishCo Branch Portal — เบิกอุปกรณ์ ({BUILD_TAG})"
-TIMEZONE = timezone(timedelta(hours=7))
+APP_TITLE = "WishCo Branch Portal — เบิกอุปกรณ์"
+TZ = timezone(timedelta(hours=7))
 
-st.set_page_config(page_title=APP_TITLE, layout="wide")
-st.title(APP_TITLE)
+# ---------- Utilities ----------
+def now_str():
+    return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
 
-def pk_diagnostics(pk: str):
-    info = {}
-    info["is_str"] = isinstance(pk, str)
-    info["len"] = len(pk) if isinstance(pk, str) else None
-    info["contains_literal_backslash_n"] = "\\n" in pk if isinstance(pk, str) else False
-    info["contains_real_newlines"] = ("\n" in pk) if isinstance(pk, str) else False
-    info["starts_with_header"] = pk.startswith("-----BEGIN PRIVATE KEY-----") if isinstance(pk, str) else False
-    info["ends_with_footer"] = pk.rstrip().endswith("-----END PRIVATE KEY-----") if isinstance(pk, str) else False
-    if isinstance(pk, str):
-        lines = pk.splitlines()
-        info["line_count"] = len(lines)
-        # find lines that have non base64 chars (ignore header/footer/empty)
-        bad = []
-        for i,ln in enumerate(lines):
-            if ln.startswith("-----BEGIN") or ln.startswith("-----END") or ln.strip()=="" or ":" in ln:
-                continue
-            # Allow base64 + '='
-            if not re.fullmatch(r"[A-Za-z0-9+/=]+", ln):
-                bad.append((i+1, ln[:60]+"..." if len(ln)>60 else ln))
-        info["bad_lines"] = bad
-        # check mod 4 length for base64 lines
-        mod4 = []
-        for i,ln in enumerate(lines):
-            if ln.startswith("-----BEGIN") or ln.startswith("-----END") or ln.strip()=="":
-                continue
-            mod4.append((i+1, len(ln)%4))
-        info["mod4_summary"] = {m: sum(1 for _,mm in mod4 if mm==m) for m in (0,1,2,3)}
-    return info
+def ensure_headers(ws, headers):
+    """Make sure header row exists and covers all fields."""
+    first = ws.row_values(1) or []
+    if not first:
+        ws.update("A1", [headers])
+        return headers
+    # append any missing headers
+    missing = [h for h in headers if h not in first]
+    if missing:
+        ws.update("A1", [first + missing])
+        first += missing
+    return first
 
-def normalize_private_key(pk: str):
-    if not isinstance(pk, str): return pk, "not_str"
-    original = pk
-    # If it looks like JSON-escaped (has \n but no real newline), unescape
-    if "\\n" in pk and "\n" not in pk:
-        pk = pk.replace("\\n", "\n")
-    # Strip leading/trailing spaces from each line
-    lines = [ln.strip() for ln in pk.splitlines()]
-    # Remove accidental surrounding quotes/backticks
-    if lines and lines[0].startswith('"') and lines[-1].endswith('"'):
-        lines[0] = lines[0].lstrip('"')
-        lines[-1] = lines[-1].rstrip('"')
-    pk = "\n".join(lines)
-    if not pk.endswith("\n"): pk += "\n"
-    changed = "changed" if pk != original else "unchanged"
-    return pk, changed
+def ws_to_df(ws):
+    vals = ws.get_all_values()
+    return pd.DataFrame(vals[1:], columns=vals[0]) if vals else pd.DataFrame()
 
-def show_secrets_status():
-    keys = list(st.secrets.keys()) if hasattr(st, "secrets") else []
-    st.sidebar.subheader("Secrets status")
-    st.sidebar.write("keys:", keys)
-    if "gcp_service_account" in st.secrets:
-        d = dict(st.secrets["gcp_service_account"])
-        prv = d.get("private_key", "")
-        d_preview = {k: ("<hidden>" if "key" in k and k!="private_key" else v) for k,v in d.items() if k!="private_key"}
-        st.sidebar.write("gcp_service_account:", d_preview)
-        di = pk_diagnostics(prv)
-        st.sidebar.write("private_key diagnostics:", di)
-        if isinstance(prv, str) and prv:
-            preview = prv.splitlines()[:2] + ["..."] + prv.splitlines()[-2:]
-            st.sidebar.code("\n".join(preview), language="text")
+def find_col(df, names:set):
+    lowset = {x.lower() for x in names}
+    for c in list(df.columns):
+        if c.strip() in names or c.strip().lower() in lowset:
+            return c
+    return None
 
+# ---------- Credentials loader (robust) ----------
 def load_credentials():
+    """Load Google service account credentials from Secrets robustly."""
     from google.oauth2.service_account import Credentials
-    scope = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
+    scope = ["https://www.googleapis.com/auth/spreadsheets",
+             "https://www.googleapis.com/auth/drive"]
 
+    # 1) Table in Secrets
     if "gcp_service_account" in st.secrets:
-        raw = dict(st.secrets["gcp_service_account"])
-        pk = raw.get("private_key","")
-        try:
-            return Credentials.from_service_account_info(raw, scopes=scope)
-        except Exception as e:
-            # try normalization
-            pk2, status = normalize_private_key(pk)
-            raw2 = dict(raw); raw2["private_key"] = pk2
-            try:
-                creds = Credentials.from_service_account_info(raw2, scopes=scope)
-                st.success(f"Normalized private_key ({status}) แล้วใช้งานได้ ✅")
-                return creds
-            except Exception as e2:
-                st.error(f"สร้าง Credentials ไม่ได้ (เดิม: {e}) / (หลัง normalize: {e2})")
-                st.stop()
+        info = dict(st.secrets["gcp_service_account"])
+        return Credentials.from_service_account_info(info, scopes=scope)
 
-    # fallbacks
-    req = {"type","project_id","private_key_id","private_key","client_email","client_id"}
-    if req.issubset(set(st.secrets.keys())):
-        info = {k: st.secrets[k] for k in req}
+    # 2) Top-level keys
+    top_keys = {"type","project_id","private_key_id","private_key","client_email","client_id"}
+    if top_keys.issubset(set(st.secrets.keys())):
+        info = {k: st.secrets[k] for k in top_keys}
         info.setdefault("auth_uri","https://accounts.google.com/o/oauth2/auth")
         info.setdefault("token_uri","https://oauth2.googleapis.com/token")
         info.setdefault("auth_provider_x509_cert_url","https://www.googleapis.com/oauth2/v1/certs")
         info.setdefault("client_x509_cert_url","")
-        try:
-            return Credentials.from_service_account_info(info, scopes=scope)
-        except Exception as e:
-            st.error(f"top-level keys พบแต่สร้าง Credentials ไม่ได้: {e}"); st.stop()
+        return Credentials.from_service_account_info(info, scopes=scope)
 
-    s = st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON","").strip()
-    if s:
+    # 3) JSON string
+    raw = st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON","").strip() or os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON","").strip()
+    if raw:
         try:
-            return Credentials.from_service_account_info(json.loads(s), scopes=scope)
-        except Exception as e:
-            st.error(f"GOOGLE_SERVICE_ACCOUNT_JSON ไม่ใช่ JSON ที่ถูกต้อง: {e}"); st.stop()
+            info = json.loads(raw)
+        except json.JSONDecodeError:
+            # รองรับกรณีผู้ใช้วางด้วย """..."""
+            info = json.loads(raw.replace("\n","").replace("\r",""))
+        return Credentials.from_service_account_info(info, scopes=scope)
 
+    # 4) File path
     p = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS","").strip()
     if p and os.path.exists(p):
-        try:
-            return Credentials.from_service_account_file(p, scopes=scope)
-        except Exception as e:
-            st.error(f"GOOGLE_APPLICATION_CREDENTIALS ใช้ไม่ได้: {e}"); st.stop()
+        return Credentials.from_service_account_file(p, scopes=scope)
 
     st.error("ไม่พบ Service Account ใน Secrets"); st.stop()
 
-def open_sheet(client):
-    import gspread
+def open_spreadsheet(client):
+    """Find spreadsheet by SHEET_ID / SHEET_URL; if missing, ask user to paste URL once."""
     SHEET_ID  = st.secrets.get("SHEET_ID","").strip() or os.environ.get("SHEET_ID","").strip()
     SHEET_URL = st.secrets.get("SHEET_URL","").strip() or os.environ.get("SHEET_URL","").strip()
-    if SHEET_ID:  return client.open_by_key(SHEET_ID)
-    if SHEET_URL: return client.open_by_url(SHEET_URL)
-    st.info("ยังไม่ตั้งค่า SHEET_ID / SHEET_URL — วางลิงก์เพื่อเชื่อมต่อ")
-    url = st.text_input("URL ของ Google Sheet", value=st.session_state.get("input_sheet_url",""))
+    if SHEET_ID:
+        return client.open_by_key(SHEET_ID)
+    if SHEET_URL:
+        return client.open_by_url(SHEET_URL)
+
+    st.info("ยังไม่ตั้งค่า SHEET_ID / SHEET_URL — วางลิงก์ Google Sheet ด้านล่างเพื่อเชื่อมต่อครั้งแรก")
+    url = st.text_input("URL ของ Google Sheet (ขึ้นต้นด้วย https://docs.google.com/spreadsheets/...)",
+                        value=st.session_state.get("input_sheet_url",""))
     if st.button("เชื่อมต่อชีตจาก URL", type="primary"):
+        if not url.strip():
+            st.warning("กรุณาวาง URL"); st.stop()
         st.session_state["input_sheet_url"] = url.strip()
         try:
             return client.open_by_url(url.strip())
@@ -138,47 +114,161 @@ def open_sheet(client):
             st.error(f"เปิดชีตไม่สำเร็จ: {e}"); st.stop()
     st.stop()
 
-def ensure_headers(ws, headers):
-    first = ws.row_values(1) or []
-    if not first: ws.update("A1", [headers])
-    else:
-        missing = [h for h in headers if h not in first]
-        if missing: ws.update("A1", [first + missing])
-
-def ws_to_df(ws):
-    vals = ws.get_all_values()
-    return pd.DataFrame(vals[1:], columns=vals[0]) if vals else pd.DataFrame()
-
-def find_col(df, names:set):
-    for c in df.columns:
-        if c.strip() in names or c.strip().lower() in {x.lower() for x in names}: return c
-    return None
-
+# ---------- App ----------
 def main():
     import gspread
-    show_secrets_status()
+    st.set_page_config(page_title=APP_TITLE, layout="wide")
+    st.title(APP_TITLE)
+
+    # authorize & open sheet
     creds = load_credentials()
     client = gspread.authorize(creds)
-    ss = open_sheet(client)
+    ss = open_spreadsheet(client)
 
+    # prepare worksheets
     titles = [w.title for w in ss.worksheets()]
-    ws_users = ss.worksheet("Users") if "Users" in titles else ss.add_worksheet("Users", 1000, 26)
-    ws_items = ss.worksheet("Items") if "Items" in titles else ss.add_worksheet("Items", 1000, 26)
+    ws_users = ss.worksheet("Users") if "Users" in titles else ss.add_worksheet("Users", rows=1000, cols=26)
+    ws_items = ss.worksheet("Items") if "Items" in titles else ss.add_worksheet("Items", rows=2000, cols=26)
+    ws_reqs  = ss.worksheet("Requests") if "Requests" in titles else ss.add_worksheet("Requests", rows=2000, cols=26)
+    ws_noti  = ss.worksheet("Notifications") if "Notifications" in titles else ss.add_worksheet("Notifications", rows=2000, cols=26)
+    ws_conf  = ss.worksheet("Settings") if "Settings" in titles else ss.add_worksheet("Settings", rows=1000, cols=26)
+
     ensure_headers(ws_users, ["username","password","role","BranchCode"])
     ensure_headers(ws_items, ["รหัส","ชื่อ","คงเหลือ","พร้อมให้เบิก(Y/N)"])
+    ensure_headers(ws_reqs,  ["ReqNo","CreatedAt","Branch","Requester","ItemCode","ItemName","Qty","Status","Approver","LastUpdate","Note","NotifiedMain(Y/N)","NotifiedBranch(Y/N)"])
+    ensure_headers(ws_noti,  ["NotiID","CreatedAt","TargetApp","TargetBranch","Type","RefID","Message","ReadFlag","ReadAt"])
+    ensure_headers(ws_conf,  ["key","value"])
 
+    # ----- Login panel -----
+    st.sidebar.subheader("เข้าสู่ระบบสำหรับสาขา/หน่วยงาน")
+    if "auth" not in st.session_state:
+        st.session_state["auth"] = False
+        st.session_state["user"] = {}
+
+    if not st.session_state["auth"]:
+        u = st.sidebar.text_input("ชื่อผู้ใช้")
+        p = st.sidebar.text_input("รหัสผ่าน", type="password")
+        if st.sidebar.button("ล็อกอิน", use_container_width=True):
+            dfu = ws_to_df(ws_users)
+            if dfu.empty:
+                st.sidebar.error("ไม่มีผู้ใช้ในชีต Users"); st.stop()
+            cu = find_col(dfu, {"username","user","บัญชีผู้ใช้"})
+            cp = find_col(dfu, {"password","รหัสผ่าน"})
+            cb = find_col(dfu, {"BranchCode","สาขา","branch"})
+            if not (cu and cp and cb):
+                st.sidebar.error("Users sheet ไม่ครบคอลัมน์ (ต้องมี username,password,BranchCode)"); st.stop()
+            row = dfu[dfu[cu] == u].head(1)
+            if row.empty or str(row.iloc[0][cp]) != p:
+                st.sidebar.error("ไม่พบผู้ใช้หรือรหัสผ่านไม่ถูกต้อง")
+            else:
+                st.session_state["auth"] = True
+                st.session_state["user"] = {"username": u, "branch": str(row.iloc[0][cb])}
+                st.sidebar.success(f"ยินดีต้อนรับ {u}")
+                time.sleep(0.5)
+                st.experimental_rerun()
+        st.stop()
+
+    # Logout
+    if st.sidebar.button("ออกจากระบบ"):
+        st.session_state["auth"] = False
+        st.session_state["user"] = {}
+        st.experimental_rerun()
+
+    branch_code = st.session_state["user"]["branch"]
+    username = st.session_state["user"]["username"]
+
+    # ----- Inventory -----
     st.header("📦 คลังสำหรับสาขา")
-    items = ws_to_df(ws_items)
-    if items.empty:
-        st.info("ยังไม่มีข้อมูลใน Items"); return
-    c_code = find_col(items, {"รหัส","ItemCode","Code"})
-    c_name = find_col(items, {"ชื่อ","Name","รายการ"})
-    c_qty  = find_col(items, {"คงเหลือ","Qty","จำนวน"})
-    c_ready= find_col(items, {"พร้อมให้เบิก","พร้อมให้เบิก(Y/N)","Ready"})
-    df = items[[c_code,c_name,c_qty] + ([c_ready] if c_ready else [])].copy()
-    df.rename(columns={c_code:"รหัส",c_name:"ชื่อ",c_qty:"คงเหลือ"}, inplace=True)
-    if c_ready: df.rename(columns={c_ready:"พร้อมให้เบิก"}, inplace=True)
-    st.dataframe(df, use_container_width=True)
+    dfi = ws_to_df(ws_items)
+    if dfi.empty:
+        st.info("ยังไม่มีข้อมูลใน Items"); st.stop()
+
+    c_code = find_col(dfi, {"รหัส","ItemCode","Code"})
+    c_name = find_col(dfi, {"ชื่อ","Name","รายการ"})
+    c_qty  = find_col(dfi, {"คงเหลือ","Qty","จำนวน"})
+    c_ready= find_col(dfi, {"พร้อมให้เบิก","พร้อมให้เบิก(Y/N)","Ready"})
+    view_df = dfi[[c_code,c_name,c_qty] + ([c_ready] if c_ready else [])].copy()
+    view_df.rename(columns={c_code:"รหัส",c_name:"ชื่อ",c_qty:"คงเหลือ"}, inplace=True)
+    if c_ready: view_df.rename(columns={c_ready:"พร้อมให้เบิก"}, inplace=True)
+    st.dataframe(view_df, use_container_width=True, height=420)
+
+    # ----- Request form -----
+    st.subheader("📝 เบิกอุปกรณ์")
+    ready_df = dfi.copy()
+    if c_ready:
+        ready_df = ready_df[ready_df[c_ready].astype(str).str.upper().str.strip().isin(["Y","YES","TRUE","1"])]
+    if ready_df.empty:
+        st.warning("ยังไม่มีอุปกรณ์ที่พร้อมให้เบิก"); st.stop()
+
+    ready_df["_label"] = ready_df[c_code].astype(str) + " — " + ready_df[c_name].astype(str) + " (คงเหลือ: " + ready_df[c_qty].astype(str) + ")"
+    choice = st.selectbox("เลือกอุปกรณ์", ready_df["_label"].tolist())
+    qty_req = st.number_input("จำนวนที่ต้องการ", min_value=1, step=1, value=1)
+    note = st.text_input("หมายเหตุ (ถ้ามี)", value="")
+
+    if st.button("ยืนยันเบิกอุปกรณ์", type="primary"):
+        row = ready_df[ready_df["_label"] == choice].iloc[0]
+        item_code = str(row[c_code])
+        item_name = str(row[c_name])
+
+        # สร้างเลขคำขอ
+        req_no = f"REQ-{branch_code}-{datetime.now(TZ).strftime('%Y%m%d-%H%M%S')}"
+        ts = now_str()
+
+        # Append into Requests
+        headers = ws_reqs.row_values(1)
+        new_rec = {
+            "ReqNo": req_no,
+            "CreatedAt": ts,
+            "Branch": branch_code,
+            "Requester": username,
+            "ItemCode": item_code,
+            "ItemName": item_name,
+            "Qty": str(int(qty_req)),
+            "Status": "pending",
+            "Approver": "",
+            "LastUpdate": ts,
+            "Note": note,
+            "NotifiedMain(Y/N)": "N",
+            "NotifiedBranch(Y/N)": "N",
+        }
+        ws_reqs.append_row([new_rec.get(h,"") for h in headers], value_input_option="USER_ENTERED")
+
+        # Create notification (for main app to poll)
+        n_headers = ws_noti.row_values(1)
+        noti = {
+            "NotiID": f"NOTI-{datetime.now(TZ).strftime('%Y%m%d-%H%M%S')}",
+            "CreatedAt": ts,
+            "TargetApp": "main_app",
+            "TargetBranch": branch_code,
+            "Type": "REQUEST_CREATED",
+            "RefID": req_no,
+            "Message": f"{branch_code} เบิกอุปกรณ์ {item_code} x {int(qty_req)} โดย {username}",
+            "ReadFlag": "N",
+            "ReadAt": "",
+        }
+        ws_noti.append_row([noti.get(h,"") for h in n_headers], value_input_option="USER_ENTERED")
+
+        st.success(f"สร้างคำขอ {req_no} สำเร็จ! (รอการดำเนินการ)")
+        time.sleep(1.2)
+        st.experimental_rerun()
+
+    # ----- My requests (preview) -----
+    with st.expander("คำขอของฉัน (ล่าสุด)"):
+        dfr = ws_to_df(ws_reqs)
+        if not dfr.empty:
+            c_reqno = find_col(dfr, {"ReqNo"})
+            c_branch= find_col(dfr, {"Branch"})
+            c_user  = find_col(dfr, {"Requester"})
+            c_created = find_col(dfr, {"CreatedAt"})
+            sub = dfr[(dfr[c_branch]==branch_code) & (dfr[c_user]==username)].copy()
+            if not sub.empty:
+                if c_created:
+                    sub = sub.sort_values(c_created, ascending=False).head(20)
+                st.dataframe(sub, use_container_width=True, height=300)
+            else:
+                st.write("ยังไม่มีคำขอล่าสุด")
+        else:
+            st.write("ยังไม่มีคำขอในระบบ")
 
 if __name__ == "__main__":
     main()
