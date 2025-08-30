@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-WishCo Branch Portal — Phase 1 (Production, Updated for display)
+WishCo Branch Portal — Phase 1 (Production, Name fallback + Ready fallback)
 
 - โหลด Service Account จาก Secrets ได้หลายรูปแบบ
 - รองรับ SHEET_ID / SHEET_URL (หรือวาง URL ครั้งแรกบนหน้า)
 - ล็อกอินสาขา (ทนต่อช่องว่าง/พิมพ์ใหญ่เล็ก)
-- แสดงสต็อก: โชว์เฉพาะ “รหัส” และ “ชื่ออุปกรณ์” (ซ่อนคงเหลือ/พร้อมให้เบิก)
+- แสดงสต็อก: โชว์เฉพาะ “รหัส” และ “ชื่ออุปกรณ์”
+- ชื่อว่างใน Items → ดึงจากแผ่น Catalog (รหัส,ชื่อ) อัตโนมัติ
+- ถ้าไม่มี/ไม่ระบุ “พร้อมให้เบิก(Y/N)” → ถือว่าเบิกได้ (หรือใช้คงเหลือ>0)
 - ฟอร์ม "เบิกอุปกรณ์" → บันทึกลง Requests + แจ้งเตือน Notifications
 """
 
@@ -23,7 +25,7 @@ def do_rerun():
         st.rerun()
     except Exception:
         try:
-            st.experimental_rerun()  # รองรับเวอร์ชันเก่า
+            st.experimental_rerun()  # สำหรับเวอร์ชันเก่า
         except Exception:
             pass
 
@@ -122,12 +124,15 @@ def main():
     ws_reqs  = ss.worksheet("Requests") if "Requests" in titles else ss.add_worksheet("Requests", 2000, 26)
     ws_noti  = ss.worksheet("Notifications") if "Notifications" in titles else ss.add_worksheet("Notifications", 2000, 26)
     ws_conf  = ss.worksheet("Settings") if "Settings" in titles else ss.add_worksheet("Settings", 1000, 26)
+    ws_cata  = ss.worksheet("Catalog") if "Catalog" in titles else None  # ออปชัน: มีไว้เป็น master code-name
 
     ensure_headers(ws_users, ["username","password","role","BranchCode"])
     ensure_headers(ws_items, ["รหัส","ชื่อ","คงเหลือ","พร้อมให้เบิก(Y/N)"])
     ensure_headers(ws_reqs,  ["ReqNo","CreatedAt","Branch","Requester","ItemCode","ItemName","Qty","Status","Approver","LastUpdate","Note","NotifiedMain(Y/N)","NotifiedBranch(Y/N)"])
     ensure_headers(ws_noti,  ["NotiID","CreatedAt","TargetApp","TargetBranch","Type","RefID","Message","ReadFlag","ReadAt"])
     ensure_headers(ws_conf,  ["key","value"])
+    if ws_cata:
+        ensure_headers(ws_cata, ["รหัส","ชื่อ"])
 
     # ----- Login panel (robust) -----
     st.sidebar.subheader("เข้าสู่ระบบสำหรับสาขา/หน่วยงาน")
@@ -176,7 +181,7 @@ def main():
     branch_code = st.session_state["user"]["branch"]
     username = st.session_state["user"]["username"]
 
-    # ----- Inventory (SHOW ONLY code + name) -----
+    # ----- Inventory (SHOW ONLY code + name, with Catalog fallback) -----
     st.header("📦 คลังสำหรับสาขา")
     dfi = ws_to_df(ws_items)
     if dfi.empty:
@@ -184,36 +189,62 @@ def main():
 
     c_code = find_col(dfi, {"รหัส","ItemCode","Code"})
     c_name = find_col(dfi, {"ชื่อ","Name","รายการ"})
-    c_qty  = find_col(dfi, {"คงเหลือ","Qty","จำนวน"})   # ยังใช้ในตรรกะได้ ถ้าจำเป็น (แต่ไม่แสดง)
-    c_ready= find_col(dfi, {"พร้อมให้เบิก","พร้อมให้เบิก(Y/N)","Ready"})  # ใช้กรองเท่านั้น ไม่แสดง
+    c_qty  = find_col(dfi, {"คงเหลือ","Qty","จำนวน"})      # ใช้เป็นเงื่อนไขพร้อมให้เบิก (fallback)
+    c_ready= find_col(dfi, {"พร้อมให้เบิก","พร้อมให้เบิก(Y/N)","Ready"})  # ใช้กรอง ถ้ามี
+
+    # สร้างชื่อแสดงผล โดยดึงจาก Catalog ถ้าชื่อใน Items ว่าง
+    name_display = dfi[c_name].astype(str).str.strip() if c_name else pd.Series([""]*len(dfi))
+    if ws_cata:
+        dfcat = ws_to_df(ws_cata)
+        cat_code = find_col(dfcat, {"รหัส","ItemCode","Code"})
+        cat_name = find_col(dfcat, {"ชื่อ","Name","รายการ","Description"})
+        if not dfcat.empty and cat_code and cat_name:
+            mp = {str(r[cat_code]).strip(): str(r[cat_name]).strip()
+                  for _, r in dfcat.iterrows() if str(r[cat_code]).strip()}
+            # เติมเฉพาะที่ว่าง
+            for idx, row in dfi.iterrows():
+                code = str(row[c_code]).strip()
+                if (not name_display.iloc[idx]) and code in mp:
+                    name_display.iloc[idx] = mp[code]
 
     # ตารางมุมมอง: แสดงเฉพาะ "รหัส" + "ชื่อ"
-    view_df = dfi[[c_code, c_name]].copy()
-    view_df.rename(columns={c_code:"รหัส", c_name:"ชื่อ"}, inplace=True)
+    view_df = pd.DataFrame({
+        "รหัส": dfi[c_code].astype(str),
+        "ชื่อ":  name_display
+    })
     st.dataframe(view_df, use_container_width=True, height=420)
 
     # ----- Request form (label = รหัส — ชื่อ) -----
     st.subheader("📝 เบิกอุปกรณ์")
-    ready_df = dfi.copy()
+    # เงื่อนไขพร้อมให้เบิก: ถ้ามีคอลัมน์ ready → ใช้เลย; ถ้าไม่มีให้ fallback เป็น (qty>0) หรือทั้งหมด
+    ready_mask = pd.Series([True]*len(dfi))
     if c_ready:
-        ready_df = ready_df[ready_df[c_ready].astype(str).str.upper().str.strip().isin(["Y","YES","TRUE","1"])]
+        ready_mask = dfi[c_ready].astype(str).str.upper().str.strip().isin(["Y","YES","TRUE","1"])
+    elif c_qty:
+        ready_mask = pd.to_numeric(dfi[c_qty], errors="coerce").fillna(0) > 0
+
+    ready_df = dfi[ready_mask].copy()
+    name_ready = name_display[ready_mask].copy()
+
     if ready_df.empty:
         st.warning("ยังไม่มีอุปกรณ์ที่พร้อมให้เบิก")
         st.stop()
 
-    ready_df["_label"] = ready_df[c_code].astype(str) + " — " + ready_df[c_name].astype(str)
+    ready_df["_label"] = ready_df[c_code].astype(str) + " — " + name_ready.replace("", "(ไม่มีชื่อ)")
     choice = st.selectbox("เลือกอุปกรณ์", ready_df["_label"].tolist())
     qty_req = st.number_input("จำนวนที่ต้องการ", min_value=1, step=1, value=1)
     note = st.text_input("หมายเหตุ (ถ้ามี)", value="")
 
     if st.button("ยืนยันเบิกอุปกรณ์", type="primary"):
         row = ready_df[ready_df["_label"] == choice].iloc[0]
+        shown_name = str(name_ready.loc[row.name]) if row.name in name_ready.index else ""
         item_code = str(row[c_code])
-        item_name = str(row[c_name])
+        item_name = shown_name or ""  # เก็บเข้า Requests ด้วยชื่อที่แสดงได้
 
         req_no = f"REQ-{branch_code}-{datetime.now(TZ).strftime('%Y%m%d-%H%M%S')}"
         ts = now_str()
 
+        # Requests
         headers = ws_reqs.row_values(1)
         new_rec = {
             "ReqNo": req_no,
@@ -232,7 +263,7 @@ def main():
         }
         ws_reqs.append_row([new_rec.get(h,"") for h in headers], value_input_option="USER_ENTERED")
 
-        # แจ้งเตือนให้แอปหลัก
+        # Notifications
         n_headers = ws_noti.row_values(1)
         noti = {
             "NotiID": f"NOTI-{datetime.now(TZ).strftime('%Y%m%d-%H%M%S')}",
