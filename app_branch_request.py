@@ -1,16 +1,31 @@
 # -*- coding: utf-8 -*-
 """
-Branch Portal — CloudSafe AutoURL
-- ไม่ต้องตั้ง SHEET_ID/SHEET_URL ใน Secrets ก็ได้
-- ถ้าไม่มีค่า จะให้กรอก Sheet URL บนหน้าเว็บ แล้วเปิดใช้งานได้ทันที
-- ใช้ st.secrets ในรูปแบบ table [gcp_service_account] เป็นหลัก
+WishCo Branch Portal — Resilient Secrets Edition
+- ยอมรับ Secrets ได้หลายรูปแบบ (กันพลาด)
+  1) [gcp_service_account]  (TOML table)  ✅ แนะนำ
+  2) [service_account]      (TOML table)
+  3) คีย์ service account วาง "บนสุด" ของ Secrets (top-level keys)
+     เช่น client_id, client_email, private_key (รองรับ private_key ทั้งแบบบรรทัดเดียวและ triple quotes)
+  4) GOOGLE_SERVICE_ACCOUNT_JSON (สตริง JSON)
+  5) GOOGLE_APPLICATION_CREDENTIALS (พา ธ ไปยังไฟล์ .json)
+- ถ้าไม่ตั้ง SHEET_ID/SHEET_URL จะแสดงช่องกรอก URL บนหน้าแอป (AutoURL)
 """
-import os, json
+import os, json, sys
 from datetime import datetime, timezone, timedelta
 import pandas as pd
 import streamlit as st
 
-# auto-load secrets to env (optional)
+# ------------------------------------------------------------
+# Optional debug: แสดงว่าเห็นคีย์อะไรใน st.secrets
+# เปิด/ปิดด้วยคิวรี่สตริง ?debug=1
+# ------------------------------------------------------------
+_DEBUG = st.query_params.get("debug", ["0"])[0] in ("1", "true", "yes")
+
+def _debug(msg):
+    if _DEBUG:
+        st.sidebar.info(msg)
+
+# auto-load secrets into env (เผื่อบางไลบรารีไปอ่านจาก env)
 try:
     for _k, _v in st.secrets.items():
         if isinstance(_v, (dict, list)):
@@ -29,14 +44,15 @@ except Exception:
 APP_TITLE = "WishCo Branch Portal — เบิกอุปกรณ์"
 TIMEZONE = timezone(timedelta(hours=7))
 
-SHEET_ID = os.environ.get("SHEET_ID", "").strip()
-SHEET_URL = os.environ.get("SHEET_URL", "").strip()
+# อ่านค่า SHEET_* จาก env หรือ secrets
+SHEET_ID = os.environ.get("SHEET_ID", st.secrets.get("SHEET_ID", "")).strip()
+SHEET_URL = os.environ.get("SHEET_URL", st.secrets.get("SHEET_URL", "")).strip()
 
-SHEET_USERS = os.environ.get("SHEET_USERS", "Users")
-SHEET_ITEMS = os.environ.get("SHEET_ITEMS", "Items")
-SHEET_REQUESTS = os.environ.get("SHEET_REQUESTS", "Requests")
-SHEET_NOTI = os.environ.get("SHEET_NOTIFICATIONS", "Notifications")
-SHEET_SETTINGS = os.environ.get("SHEET_SETTINGS", "Settings")
+SHEET_USERS = os.environ.get("SHEET_USERS", st.secrets.get("SHEET_USERS", "Users"))
+SHEET_ITEMS = os.environ.get("SHEET_ITEMS", st.secrets.get("SHEET_ITEMS", "Items"))
+SHEET_REQUESTS = os.environ.get("SHEET_REQUESTS", st.secrets.get("SHEET_REQUESTS", "Requests"))
+SHEET_NOTI = os.environ.get("SHEET_NOTIFICATIONS", st.secrets.get("SHEET_NOTIFICATIONS", "Notifications"))
+SHEET_SETTINGS = os.environ.get("SHEET_SETTINGS", st.secrets.get("SHEET_SETTINGS", "Settings"))
 
 VISIBLE_AVAILABLE_ONLY = "AVAILABLE_ONLY"
 VISIBLE_ALL_WITH_FLAG = "ALL_WITH_FLAG"
@@ -45,32 +61,66 @@ NOTI_REQ_CREATED, NOTI_ITEM_ISSUED = "REQ_CREATED","ITEM_ISSUED"
 
 def _now_str(): return datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
 
+def _try_build_info_from_top_level(keys):
+    """ลองสร้าง dict service account จากคีย์บนสุดของ st.secrets (กรณีผู้ใช้วางคีย์แบบ top-level)"""
+    req = ("type","project_id","private_key_id","private_key","client_email","client_id")
+    if not all(k in keys for k in req):
+        return None
+    # ใช้ค่าโดยตรง
+    info = {k: st.secrets[k] for k in keys}
+    # เติมค่าเริ่มต้นให้คีย์ที่อาจหายไป
+    info.setdefault("type", "service_account")
+    info.setdefault("auth_uri", "https://accounts.google.com/o/oauth2/auth")
+    info.setdefault("token_uri", "https://oauth2.googleapis.com/token")
+    info.setdefault("auth_provider_x509_cert_url", "https://www.googleapis.com/oauth2/v1/certs")
+    info.setdefault("client_x509_cert_url", "")
+    return info
+
 def _load_credentials():
-    # prefer table in secrets
-    if "gcp_service_account" in st.secrets and isinstance(st.secrets["gcp_service_account"], dict):
+    # 1) รูปแบบ table: [gcp_service_account] / [service_account]
+    for name in ("gcp_service_account", "service_account"):
+        if name in st.secrets and isinstance(st.secrets[name], dict):
+            _debug(f"ใช้ secrets แบบ table: [{name}]")
+            scope = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
+            return Credentials.from_service_account_info(dict(st.secrets[name]), scopes=scope)
+
+    # 2) top-level keys (ผู้ใช้วางคีย์ไว้บนสุด)
+    top_keys = set(st.secrets.keys())
+    info = _try_build_info_from_top_level(top_keys)
+    if info:
+        _debug("ใช้ secrets แบบ top-level keys")
         scope = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
-        return Credentials.from_service_account_info(dict(st.secrets["gcp_service_account"]), scopes=scope)
-    # fallback JSON string
+        return Credentials.from_service_account_info(info, scopes=scope)
+
+    # 3) JSON string
     s = st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON", os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON","")).strip()
     if s:
         try:
             info = json.loads(s)
+            _debug("ใช้ GOOGLE_SERVICE_ACCOUNT_JSON")
             scope = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
             return Credentials.from_service_account_info(info, scopes=scope)
-        except Exception:
+        except Exception as e:
             st.error("GOOGLE_SERVICE_ACCOUNT_JSON ไม่ใช่ JSON ที่ถูกต้อง"); return None
-    # fallback file path
+
+    # 4) file path
     p = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS","").strip()
     if p and os.path.exists(p):
+        _debug(f"ใช้ไฟล์ credentials: {p}")
         scope = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
         return Credentials.from_service_account_file(p, scopes=scope)
-    st.error("ไม่พบ Service Account ใน Secrets"); return None
+
+    # 5) ไม่พบอะไรเลย
+    st.error("ไม่พบ Service Account ใน Secrets")
+    if _DEBUG:
+        st.sidebar.write("Secrets keys:", list(st.secrets.keys()))
+    return None
 
 def _open_spreadsheet(client):
-    # 1) env provided
     if SHEET_ID: return client.open_by_key(SHEET_ID)
     if SHEET_URL: return client.open_by_url(SHEET_URL)
-    # 2) session prompt
+
+    # AutoURL: ให้กรอก URL บนหน้าเว็บ
     st.warning("ยังไม่ตั้งค่า SHEET_ID/SHEET_URL — โปรดวางลิงก์ Google Sheet ที่ใช้ร่วมกับแอปเดิม")
     default = st.session_state.get("input_sheet_url","")
     url = st.text_input("วาง URL ของไฟล์ Google Sheet (เริ่มต้นด้วย https://docs.google.com/spreadsheets/d/...)", value=default)
@@ -79,20 +129,16 @@ def _open_spreadsheet(client):
             st.error("กรุณาวาง URL ของชีต"); st.stop()
         st.session_state["input_sheet_url"] = url.strip()
         try:
-            ss = client.open_by_url(url.strip())
-            st.success("เชื่อมต่อชีตสำเร็จ")
-            return ss
+            ss = client.open_by_url(url.strip()); st.success("เชื่อมต่อชีตสำเร็จ"); return ss
         except Exception as e:
-            st.error(f"เปิดชีตไม่สำเร็จ: {e}")
-            st.stop()
+            st.error(f"เปิดชีตไม่สำเร็จ: {e}"); st.stop()
     st.stop()
 
 def _ensure_worksheet(ss, name, headers):
     try:
         ws = ss.worksheet(name)
     except Exception:
-        ws = ss.add_worksheet(title=name, rows=1000, cols=50)
-        ws.append_row(headers); return ws
+        ws = ss.add_worksheet(title=name, rows=1000, cols=50); ws.append_row(headers); return ws
     first = ws.row_values(1) or []
     missing = [h for h in headers if h not in first]
     if not first: ws.update("A1", [headers])
@@ -236,6 +282,7 @@ def make_noti_id():
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
+
     creds = _load_credentials()
     if creds is None: st.stop()
     client = gspread.authorize(creds)
