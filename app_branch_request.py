@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-WishCo Branch Portal — Phase 1 (On-demand + 429-safe, Patched with full history)
+WishCo Branch Portal — Phase 1 (On-demand + 429-safe, Patched with multi-select editor & full history)
 
-- แท็บ "เบิกอุปกรณ์": เลือกอุปกรณ์/จำนวน -> กด "เบิกอุปกรณ์" จะสร้าง OrderNo และบันทึก CreatedAt
-- แท็บ "ประวัติคำสั่งเบิก": แสดง "รายการอุปกรณ์ทุกชิ้น" ที่ผู้ใช้ทำเบิกพร้อม เวลา + ออเดอร์ อ้างอิง
+- แท็บ "เบิกอุปกรณ์": เลือกอุปกรณ์/จำนวนได้หลายรายการ -> กด "เบิกอุปกรณ์" จะสร้าง OrderNo เดียว
+- แท็บ "ประวัติคำสั่งเบิก": แสดง "ทุกรายการที่ทำเบิก" พร้อม เวลา + ออเดอร์ + รหัส + ชื่อ + จำนวน + สถานะ
 """
 
 import os, json, time, re, random
@@ -368,9 +368,27 @@ def main():
             }
         )
 
+        # ---------------------- ORDER EDITOR (Multi-select & auto quantity) ----------------------
         if "order_table" not in st.session_state or st.session_state.get("order_table_shape") != base_df.shape:
             st.session_state["order_table"] = base_df.copy()
             st.session_state["order_table_shape"] = base_df.shape
+            st.session_state["prev_sel_idx"] = set()
+
+        csel1, csel2, _ = st.columns([1,1,8])
+        if csel1.button("เลือกทั้งหมด"):
+            df_tmp = st.session_state["order_table"].copy()
+            df_tmp["เลือก"] = True
+            df_tmp["จำนวนที่ต้องการ"] = pd.to_numeric(df_tmp["จำนวนที่ต้องการ"], errors="coerce").fillna(0)
+            df_tmp.loc[df_tmp["จำนวนที่ต้องการ"] <= 0, "จำนวนที่ต้องการ"] = 1
+            st.session_state["order_table"] = df_tmp
+            st.session_state["prev_sel_idx"] = set(df_tmp.index[df_tmp["เลือก"] == True].tolist())
+
+        if csel2.button("ล้างการเลือก"):
+            df_tmp = st.session_state["order_table"].copy()
+            df_tmp["เลือก"] = False
+            df_tmp["จำนวนที่ต้องการ"] = 0
+            st.session_state["order_table"] = df_tmp
+            st.session_state["prev_sel_idx"] = set()
 
         edited = st.data_editor(
             st.session_state["order_table"],
@@ -383,6 +401,18 @@ def main():
             },
             hide_index=True,
         )
+
+        edited["จำนวนที่ต้องการ"] = pd.to_numeric(edited["จำนวนที่ต้องการ"], errors="coerce").fillna(0)
+
+        prev_set = st.session_state.get("prev_sel_idx", set())
+        curr_set = set(edited.index[edited["เลือก"] == True].tolist())
+        new_checked = curr_set - prev_set
+        if new_checked:
+            for i in new_checked:
+                if edited.at[i, "จำนวนที่ต้องการ"] <= 0:
+                    edited.at[i, "จำนวนที่ต้องการ"] = 1  # auto 1 เมื่อเพิ่งติ๊กเลือก
+
+        st.session_state["prev_sel_idx"] = curr_set
         st.session_state["order_table"] = edited
 
         col1, col2 = st.columns([1, 1])
@@ -392,8 +422,10 @@ def main():
         if clear:
             st.session_state.pop("order_table", None)
             st.session_state.pop("order_table_shape", None)
+            st.session_state["prev_sel_idx"] = set()
             st.success("ล้างการเลือกแล้ว")
             time.sleep(0.3); do_rerun()
+        # -----------------------------------------------------------------------------------------
 
         # ----- กด "เบิกอุปกรณ์" -----
         if submit:
@@ -486,6 +518,7 @@ def main():
 
             st.session_state.pop("order_table", None)
             st.session_state.pop("order_table_shape", None)
+            st.session_state["prev_sel_idx"] = set()
 
     # ===== Tab: ประวัติคำสั่งเบิก =====
     with tab_hist:
