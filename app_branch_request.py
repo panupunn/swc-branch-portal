@@ -1,10 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-WishCo Branch Portal — Phase 1 (Patched to avoid 429):
-- แคช mapping แผ่นงาน (title -> sheetId) 5 นาที (อ่าน metadata แค่ครั้งเดียว)
-- เปิดแผ่นงานด้วย sheetId (get_worksheet_by_id) เพื่อลดการ fetch metadata ซ้ำ
-- มี Exponential Backoff เมื่อเจอ APIError 429
-- โครงสร้าง “ตารางเดียว” + OrderNo ตามที่ตกลง
+WishCo Branch Portal — Phase 1 (Patched: fix TypeError + 429-safe)
 """
 
 import os, json, time, re, random
@@ -17,7 +13,7 @@ from gspread.exceptions import WorksheetNotFound, APIError
 APP_TITLE = "WishCo Branch Portal — เบิกอุปกรณ์"
 TZ = timezone(timedelta(hours=7))
 
-# ----------------- Utils -----------------
+# ---------- small utils ----------
 def do_rerun():
     try: st.rerun()
     except Exception:
@@ -58,7 +54,7 @@ def find_col_fuzzy(df, keywords) -> str | None:
                 return h
     return None
 
-# ----------------- Credentials -----------------
+# ---------- credentials ----------
 def load_credentials():
     from google.oauth2.service_account import Credentials
     scope = ["https://www.googleapis.com/auth/spreadsheets",
@@ -68,9 +64,9 @@ def load_credentials():
         info = dict(st.secrets["gcp_service_account"])
         return Credentials.from_service_account_info(info, scopes=scope)
 
-    top_keys = {"type","project_id","private_key_id","private_key","client_email","client_id"}
-    if top_keys.issubset(set(st.secrets.keys())):
-        info = {k: st.secrets[k] for k in top_keys}
+    top = {"type","project_id","private_key_id","private_key","client_email","client_id"}
+    if top.issubset(set(st.secrets.keys())):
+        info = {k: st.secrets[k] for k in top}
         info.setdefault("auth_uri","https://accounts.google.com/o/oauth2/auth")
         info.setdefault("token_uri","https://oauth2.googleapis.com/token")
         info.setdefault("auth_provider_x509_cert_url","https://www.googleapis.com/oauth2/v1/certs")
@@ -100,10 +96,10 @@ def _extract_sheet_id(id_or_url: str) -> str | None:
 
 def open_spreadsheet(client):
     raw = (
-        st.secrets.get("SHEET_ID", "").strip()
-        or st.secrets.get("SHEET_URL", "").strip()
-        or os.environ.get("SHEET_ID", "").strip()
-        or os.environ.get("SHEET_URL", "").strip()
+        st.secrets.get("SHEET_ID","").strip()
+        or st.secrets.get("SHEET_URL","").strip()
+        or os.environ.get("SHEET_ID","").strip()
+        or os.environ.get("SHEET_URL","").strip()
     )
 
     def _try_open(sid: str):
@@ -113,10 +109,7 @@ def open_spreadsheet(client):
             sa = getattr(client.auth, "service_account_email", None)
             with st.expander("รายละเอียดการเชื่อมต่อ / วิธีแก้ (คลิกเพื่อดู)", expanded=True):
                 st.error(f"เปิดสเปรดชีตไม่สำเร็จ (ID: {sid})")
-                st.write("1) แชร์ไฟล์ให้ Service Account (สิทธิ Editor)")
                 if sa: st.write("Service Account:", f"`{sa}`")
-                st.write("2) ตรวจ SHEET_URL / SHEET_ID ว่าถูกต้อง")
-                st.write("รายละเอียดข้อผิดพลาด (developer):")
                 st.exception(e)
             st.stop()
 
@@ -133,11 +126,10 @@ def open_spreadsheet(client):
         return _try_open(sid2)
     st.stop()
 
-# ----------------- Retry helper -----------------
+# ---------- 429 helpers ----------
 def _is_429(e: Exception) -> bool:
     msg = str(e)
-    if "429" in msg and "Quota exceeded" in msg:
-        return True
+    if "429" in msg and "Quota exceeded" in msg: return True
     try:
         code = getattr(getattr(e, "response", None), "status_code", None)
         return code == 429
@@ -145,7 +137,6 @@ def _is_429(e: Exception) -> bool:
         return False
 
 def with_retry(func, *args, **kwargs):
-    """เรียกฟังก์ชัน gspread พร้อม exponential backoff เมื่อเจอ 429"""
     attempt = 0
     while True:
         try:
@@ -154,12 +145,10 @@ def with_retry(func, *args, **kwargs):
             if _is_429(e) and attempt < 5:
                 wait = (2 ** attempt) + random.uniform(0, 0.5)
                 st.info(f"โควต้าอ่านเกินชั่วคราว รอ {wait:.1f}s แล้วลองใหม่…")
-                time.sleep(wait)
-                attempt += 1
-                continue
+                time.sleep(wait); attempt += 1; continue
             raise
 
-# ----------------- Cached connectors & readers -----------------
+# ---------- cached connectors/readers ----------
 @st.cache_resource(show_spinner=False)
 def get_client_and_ss():
     creds = load_credentials()
@@ -171,24 +160,19 @@ def get_client_and_ss():
 def get_worksheets_map() -> dict:
     """อ่าน metadata แค่ครั้งเดียว แล้วแคช 5 นาที: {title: sheetId}"""
     _, ss = get_client_and_ss()
-    wss = with_retry(ss.worksheets)
-    lst = wss()
-    # gspread Worksheet.id = sheetId (int)
+    lst = with_retry(ss.worksheets)   # <— คืนค่ามาเลย (อย่าเรียกซ้ำ)
     return {w.title: w.id for w in lst}
 
 def get_or_create_ws(ss, title: str, rows: int = 1000, cols: int = 26):
-    """เปิดแผ่นงานด้วย sheetId ถ้ามี; ถ้าไม่มีให้สร้าง แล้วเคลียร์ cache mapping"""
     try:
         mp = get_worksheets_map()
         if title in mp:
             return with_retry(ss.get_worksheet_by_id, mp[title])
-        # ไม่มี → สร้าง
         ws = with_retry(ss.add_worksheet, title, rows, cols)
-        st.cache_data.clear()  # เคลียร์ mapping เพื่อให้เห็นแผ่นงานใหม่
+        st.cache_data.clear()  # refresh mapping
         return ws
     except APIError as e:
         if _is_429(e):
-            # โควต้าเกิน — แจ้งและหยุดอย่างสุภาพ
             with st.expander("รายละเอียดการเชื่อมต่อ / ข้อผิดพลาด (คลิกเพื่อดู)", expanded=True):
                 st.error(f"เปิดแผ่นงาน '{title}' ไม่สำเร็จ (โควต้าอ่านเกินชั่วคราว)")
                 st.exception(e)
@@ -200,22 +184,19 @@ def read_sheet_as_df(sheet_name: str) -> pd.DataFrame:
     """อ่านชีตเป็น DataFrame (cache 90s)"""
     _, ss = get_client_and_ss()
     ws = get_or_create_ws(ss, sheet_name, 1000, 26)
-    vals = with_retry(ws.get_all_values)
-    vals = vals()
+    vals = with_retry(ws.get_all_values)   # <— อย่าเรียกซ้ำ
     return pd.DataFrame(vals[1:], columns=vals[0]) if vals else pd.DataFrame()
 
-# ----------------- App -----------------
+# ---------- app ----------
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
 
     client, ss = get_client_and_ss()
-    try:
-        st.caption(f"Service Account: `{client.auth.service_account_email}`")
-    except Exception:
-        pass
+    try: st.caption(f"Service Account: `{client.auth.service_account_email}`")
+    except Exception: pass
 
-    # เปิดเฉพาะชีตที่ต้องใช้ (ผ่าน mapping + retry)
+    # open sheets
     ws_users = get_or_create_ws(ss, "Users",         1000, 26)
     ws_items = get_or_create_ws(ss, "Items",         2000, 26)
     ws_reqs  = get_or_create_ws(ss, "Requests",      2000, 26)
@@ -228,7 +209,7 @@ def main():
     ensure_headers(ws_noti,  ["NotiID","CreatedAt","TargetApp","TargetBranch","Type","RefID","Message","ReadFlag","ReadAt"])
     ensure_headers(ws_conf,  ["key","value"])
 
-    # -------- Login --------
+    # Login
     st.sidebar.subheader("เข้าสู่ระบบสำหรับสาขา/หน่วยงาน")
     if "auth" not in st.session_state:
         st.session_state["auth"] = False; st.session_state["user"] = {}
@@ -260,9 +241,8 @@ def main():
     branch_code = st.session_state["user"]["branch"]
     username    = st.session_state["user"]["username"]
 
-    # -------- Inventory (single table) --------
+    # Inventory
     st.header("📦 รายการอุปกรณ์ที่พร้อมให้เบิก")
-
     dfi = read_sheet_as_df("Items")
     if dfi.empty:
         st.info("ยังไม่มีข้อมูลใน Items"); st.stop()
@@ -271,7 +251,6 @@ def main():
     if not c_code:
         st.error("Items: หา 'รหัส' ไม่พบ"); st.stop()
 
-    # เลือกคอลัมน์ชื่อแบบฉลาด
     name_candidates = []
     for keys in [
         {"ชื่ออุปกรณ์","ชื่อสินค้า","itemname","productname"},
@@ -303,7 +282,6 @@ def main():
 
     ready_df = dfi[ready_mask].copy()
     name_ready = name_display[ready_mask].copy()
-
     if ready_df.empty:
         st.warning("ยังไม่มีอุปกรณ์ที่พร้อมให้เบิก"); st.stop()
 
@@ -341,7 +319,7 @@ def main():
         st.success("ล้างการเลือกแล้ว")
         time.sleep(0.3); do_rerun()
 
-    # -------- Submit --------
+    # Submit
     if submit:
         sel = edited[(edited["เลือก"] == True) & (pd.to_numeric(edited["จำนวนที่ต้องการ"], errors="coerce").fillna(0) > 0)].copy()
         if sel.empty:
@@ -359,7 +337,7 @@ def main():
             ]
             with_retry(ws_reqs.append_row, row, value_input_option="USER_ENTERED")
 
-        n_headers = ws_noti.row_values(1)
+        n_headers = with_retry(ws_noti.row_values, 1)  # <— ห่อด้วย retry
         noti = {
             "NotiID": f"NOTI-{datetime.now(TZ).strftime('%Y%m%d-%H%M%S')}",
             "CreatedAt": ts,
@@ -373,9 +351,7 @@ def main():
         }
         with_retry(ws_noti.append_row, [noti.get(h,"") for h in n_headers], value_input_option="USER_ENTERED")
 
-        # เคลียร์ cache อ่านชีต → หน้า History จะเห็นออเดอร์ใหม่ทันที
         st.cache_data.clear()
-
         with st.success(f"สร้างคำสั่งเบิกสำเร็จ: **{order_no}**"):
             st.write("สรุปรายการในออร์เดอร์:")
             st.dataframe(sel[["รหัส","ชื่อ","จำนวนที่ต้องการ"]].rename(columns={"จำนวนที่ต้องการ":"Qty"}),
@@ -384,7 +360,7 @@ def main():
         st.session_state.pop("order_table", None)
         st.session_state.pop("order_table_shape", None)
 
-    # -------- History --------
+    # History
     st.markdown("### 🧾 ประวัติคำสั่งเบิก (ตามออร์เดอร์)")
     dfr = read_sheet_as_df("Requests")
     if not dfr.empty:
