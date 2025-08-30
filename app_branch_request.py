@@ -1,18 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-WishCo Branch Portal — Phase 1
-- รองรับเลือกหลายรายการในครั้งเดียว (OrderNo เดียว)
-- มีบล็อก "ปรับจำนวนอย่างรวดเร็ว" พร้อมปุ่ม +/- (ขนาดเล็ก)
-- บันทึกลงชีต Requests + แจ้งเตือนในชีต Notifications
-- หน้า "ประวัติคำสั่งเบิก" แสดงทุกรายการที่คุณทำเบิก
+WishCo Branch Portal — Phase 1 (patched with compact right-aligned +/- control)
+- เลือกรายการหลายชิ้นในครั้งเดียว (OrderNo เดียว)
+- บล็อก "ปรับจำนวนอย่างรวดเร็ว" แบบกล่องยาว มีปุ่ม − (เทา) และ + (แดง) ชิดขวา ตามภาพตัวอย่าง
+- บันทึกลงชีต Requests + แจ้งเตือนใน Notifications
+- แท็บประวัติ แสดงออร์เดอร์/รายการที่ผู้ใช้ทำเบิกทั้งหมด
 
-หมายเหตุ:
-- ต้องตั้งค่า Secrets: gcp_service_account (หรือ GOOGLE_SERVICE_ACCOUNT_JSON) และ SHEET_URL/SHEET_ID
-- ชีตที่ใช้:
-  - Items: แสดงอุปกรณ์พร้อมให้เบิก
-  - Users: ตรวจสอบล็อกอิน (username/password/BranchCode)
-  - Requests: เก็บคำขอเบิก (สร้างให้อัตโนมัติ)
-  - Notifications: แจ้งเตือนแอปหลัก (สร้างให้อัตโนมัติ)
+Secrets ที่ต้องมี:
+- gcp_service_account (object) หรือ GOOGLE_SERVICE_ACCOUNT_JSON (string) หรือ GOOGLE_APPLICATION_CREDENTIALS (file path)
+- SHEET_URL หรือ SHEET_ID
+
+ชีตที่ใช้:
+- Items, Users, Requests, Notifications
 """
 
 import os, json, time, re, random
@@ -64,11 +63,9 @@ def find_col_fuzzy(df, keywords) -> str | None:
     headers = list(df.columns)
     norm = {h: _norm(h) for h in headers}
     kset = {_norm(k) for k in keywords}
-    # ตรงตัวก่อน
     for h in headers:
         if norm[h] in kset:
             return h
-    # partial match
     for h in headers:
         for k in kset:
             if k and (k in norm[h]):
@@ -77,14 +74,13 @@ def find_col_fuzzy(df, keywords) -> str | None:
 
 # ====================== Credentials & Spreadsheet ======================
 def load_credentials():
-    """โหลด Service Account ได้ 4 รูปแบบ: st.secrets[gcp_service_account]/top-level/JSON string/env file"""
+    """โหลด Service Account ได้ 4 รูปแบบ: secrets[gcp_service_account]/top-level/JSON string/env file"""
     from google.oauth2.service_account import Credentials
     scope = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-
-    # 1) st.secrets[gcp_service_account]
+    # 1) secrets[gcp_service_account]
     if "gcp_service_account" in st.secrets:
         info = dict(st.secrets["gcp_service_account"])
         return Credentials.from_service_account_info(info, scopes=scope)
@@ -108,7 +104,6 @@ def load_credentials():
         try:
             info = json.loads(raw)
         except json.JSONDecodeError:
-            # กันกรณีวางแล้วมี \n แปลก ๆ
             info = json.loads(raw.replace("\n", "\\n"))
         return Credentials.from_service_account_info(info, scopes=scope)
 
@@ -178,10 +173,6 @@ def _is_429(e: Exception) -> bool:
         return False
 
 def with_retry(func, *args, announce=False, **kwargs):
-    """
-    เรียก gspread function พร้อม Exponential backoff เมื่อเจอ 429
-    - announce=True จะขึ้นข้อความแจ้งเตือน 'ครั้งแรก' เท่านั้น (ไม่สแปม)
-    """
     attempt = 0
     while True:
         try:
@@ -207,19 +198,17 @@ def get_client_and_ss():
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_worksheets_map() -> dict:
-    """อ่าน metadata แค่ครั้งเดียว แล้วแคช 5 นาที: {title: sheetId}"""
     _, ss = get_client_and_ss()
     lst = with_retry(ss.worksheets)
     return {w.title: w.id for w in lst}
 
 def get_or_create_ws(ss, title: str, rows: int = 1000, cols: int = 26):
-    """เปิดแผ่นงานด้วย sheetId ถ้ามี; ถ้าไม่มีให้สร้าง แล้วเคลียร์ mapping"""
     try:
         mp = get_worksheets_map()
         if title in mp:
             return with_retry(ss.get_worksheet_by_id, mp[title])
         ws = with_retry(ss.add_worksheet, title, rows, cols)
-        st.cache_data.clear()  # refresh mapping cache
+        st.cache_data.clear()
         return ws
     except APIError as e:
         if _is_429(e):
@@ -231,7 +220,6 @@ def get_or_create_ws(ss, title: str, rows: int = 1000, cols: int = 26):
 
 @st.cache_data(ttl=90, show_spinner=False)
 def read_sheet_as_df(sheet_name: str) -> pd.DataFrame:
-    """อ่านชีตเป็น DataFrame (cache 90s)"""
     _, ss = get_client_and_ss()
     ws = get_or_create_ws(ss, sheet_name, 1000, 26)
     vals = with_retry(ws.get_all_values, announce=True)
@@ -239,7 +227,6 @@ def read_sheet_as_df(sheet_name: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=90, show_spinner=False)
 def read_requests_df() -> pd.DataFrame:
-    """อ่านชีต Requests (on-demand)"""
     _, ss = get_client_and_ss()
     ws = get_or_create_ws(ss, "Requests", 2000, 26)
     vals = with_retry(ws.get_all_values, announce=True)
@@ -307,18 +294,15 @@ def main():
     with tab_req:
         st.header("📦 รายการอุปกรณ์ที่พร้อมให้เบิก", anchor=False)
 
-        # โหลดเฉพาะ Items
         dfi = read_sheet_as_df("Items")
         if dfi.empty:
             st.info("ยังไม่มีข้อมูลใน Items"); st.stop()
 
-        # จับคอลัมน์สำคัญ
         c_code = find_col_fuzzy(dfi, {"รหัส", "itemcode", "code", "sku", "part", "partno", "partnumber"})
         if not c_code:
-            st.error("Items: หา 'รหัส' ไม่พบ")
-            st.stop()
+            st.error("Items: หา 'รหัส' ไม่พบ"); st.stop()
 
-        # ชื่ออุปกรณ์ (เลือกคอลัมน์ที่มีข้อมูลมากที่สุด)
+        # ชื่ออุปกรณ์
         name_candidates = []
         for keys in [
             {"ชื่ออุปกรณ์", "ชื่อสินค้า", "itemname", "productname"},
@@ -365,8 +349,7 @@ def main():
         name_ready = name_display[ready_mask].copy()
 
         if ready_df.empty:
-            st.warning("ยังไม่มีอุปกรณ์ที่พร้อมให้เบิก")
-            st.stop()
+            st.warning("ยังไม่มีอุปกรณ์ที่พร้อมให้เบิก"); st.stop()
 
         base_df = pd.DataFrame(
             {
@@ -377,7 +360,7 @@ def main():
             }
         )
 
-        # ---------------------- ORDER EDITOR (Multi-select & auto quantity) ----------------------
+        # ---------------------- ORDER EDITOR ----------------------
         if "order_table" not in st.session_state or st.session_state.get("order_table_shape") != base_df.shape:
             st.session_state["order_table"] = base_df.copy()
             st.session_state["order_table_shape"] = base_df.shape
@@ -424,7 +407,7 @@ def main():
         st.session_state["prev_sel_idx"] = curr_set
         st.session_state["order_table"] = edited
 
-        # ====== ปรับจำนวนอย่างรวดเร็ว (+ / −) — ปุ่มเล็กลง ======
+        # ====== ปรับจำนวนอย่างรวดเร็ว (+ / −) — สไตล์ตามภาพ ======
         selected_idx = list(
             st.session_state["order_table"].index[
                 st.session_state["order_table"]["เลือก"] == True
@@ -432,34 +415,41 @@ def main():
         )
 
         if selected_idx:
-            # CSS ย่อปุ่มเฉพาะในบล็อกนี้
+            # CSS จัดให้เป็นกล่องยาว + ปุ่ม – / + แนบขวา (เทา/แดง)
             st.markdown("""
             <style>
-            .qty-toolbar .stButton>button{
-                padding: 0.15rem 0.40rem !important;
-                min-height: 0 !important;
-                line-height: 1.1 !important;
-                font-size: 0.88rem !important;
-                border-radius: 8px !important;
+            .qty-row .qval{
+                background-color:#1f2937;        /* เทาเข้ม */
+                color:#e5e7eb;
+                border:1px solid #374151;
+                height: 40px;
+                border-radius: 8px 0 0 8px;
+                display:flex; align-items:center; justify-content:center;
+                font-weight:700; width:100%;
             }
-            .qty-toolbar .qty-val{
-                text-align:center; font-weight:700; padding-top:.20rem;
+            .qty-row .stButton>button{
+                height:40px; min-height:40px; width:44px;
+                padding:0; margin:0; line-height:1;
+                font-size:1rem; font-weight:700; border-radius:0;
             }
+            .qty-row .btn-minus>button{
+                background:#374151; color:#ffffff; border:1px solid #374151;
+            }
+            .qty-row .btn-plus>button{
+                background:#ef4444; color:#ffffff; border:1px solid #ef4444;
+                border-radius:0 8px 8px 0;
+            }
+            .qty-row [data-testid="column"]{ padding:0 2px; }
+            .qty-row { margin:0.35rem 0 0.6rem 0; }
             </style>
             """, unsafe_allow_html=True)
 
             st.markdown("#### 🔢 ปรับจำนวนอย่างรวดเร็ว")
-            st.markdown('<div class="qty-toolbar">', unsafe_allow_html=True)
-
-            # ส่วนหัว
-            h1, h2, h3, h4, h5 = st.columns([2, 6, 1, 1.2, 1])
+            h1, h2, h3 = st.columns([2, 6, 4])
             h1.markdown("**รหัส**")
             h2.markdown("**ชื่อ**")
-            h3.markdown("**−**")
-            h4.markdown("**จำนวน**", help="จำนวนที่ต้องการเบิก")
-            h5.markdown("**+**")
+            h3.markdown("**จำนวนที่รับเบิก**")
 
-            # แถวข้อมูล
             for i in selected_idx:
                 row = st.session_state["order_table"].loc[i]
                 q = int(pd.to_numeric(row["จำนวนที่ต้องการ"], errors="coerce") or 0)
@@ -467,24 +457,41 @@ def main():
                     q = 1
                     st.session_state["order_table"].loc[i, "จำนวนที่ต้องการ"] = q
 
-                c1, c2, c3, c4, c5 = st.columns([2, 6, 1, 1.2, 1])
+                c1, c2, c3 = st.columns([2, 6, 4])
                 c1.write(str(row["รหัส"]))
                 c2.write(str(row["ชื่อ"]))
 
-                # ปุ่ม − (ย่อขนาดด้วย CSS ด้านบน)
-                if c3.button("−", key=f"qminus_{i}") and q > 1:
-                    st.session_state["order_table"].loc[i, "จำนวนที่ต้องการ"] = q - 1
-                    do_rerun()
+                with c3.container():
+                    st.markdown('<div class="qty-row">', unsafe_allow_html=True)
+                    qcol, mcol, pcol = st.columns([10, 1, 1])
+                    qcol.markdown(f"<div class='qval'>{q}</div>", unsafe_allow_html=True)
 
-                # ค่าแสดงจำนวนตรงกลาง (สไตล์เล็กลงนิด)
-                c4.markdown(f"<div class='qty-val'>{q}</div>", unsafe_allow_html=True)
+                    with mcol:
+                        if st.button("−", key=f"qminus_{i}", help="ลดจำนวน 1", use_container_width=True):
+                            if q > 1:
+                                st.session_state["order_table"].loc[i, "จำนวนที่ต้องการ"] = q - 1
+                                do_rerun()
+                    # ใส่คลาสให้ปุ่มลบ
+                    st.markdown("""
+                        <script>
+                        const btns = window.parent.document.querySelectorAll('[data-testid="stButton"] button');
+                        btns.forEach(b => { if(b.innerText==='−') { b.parentElement.classList.add('btn-minus'); }});
+                        </script>
+                    """, unsafe_allow_html=True)
 
-                # ปุ่ม +
-                if c5.button("+", key=f"qplus_{i}"):
-                    st.session_state["order_table"].loc[i, "จำนวนที่ต้องการ"] = q + 1
-                    do_rerun()
+                    with pcol:
+                        if st.button("+", key=f"qplus_{i}", help="เพิ่มจำนวน 1", use_container_width=True):
+                            st.session_state["order_table"].loc[i, "จำนวนที่ต้องการ"] = q + 1
+                            do_rerun()
+                    # ใส่คลาสให้ปุ่มเพิ่ม
+                    st.markdown("""
+                        <script>
+                        const btns2 = window.parent.document.querySelectorAll('[data-testid="stButton"] button');
+                        btns2.forEach(b => { if(b.innerText==='+') { b.parentElement.classList.add('btn-plus'); }});
+                        </script>
+                    """, unsafe_allow_html=True)
 
-            st.markdown('</div>', unsafe_allow_html=True)
+                    st.markdown('</div>', unsafe_allow_html=True)
         # ===================================================
 
         col1, col2 = st.columns([1, 1])
@@ -509,32 +516,20 @@ def main():
                 st.warning("กรุณาเลือกอุปกรณ์อย่างน้อย 1 รายการ และระบุจำนวน")
                 st.stop()
 
-            # เปิดเฉพาะตอนจะเขียน เพื่อลด request
             ws_reqs = get_or_create_ws(ss, "Requests", 2000, 26)
             ws_noti = get_or_create_ws(ss, "Notifications", 2000, 26)
 
             ensure_headers(
                 ws_reqs,
                 [
-                    "ReqNo",
-                    "OrderNo",
-                    "CreatedAt",
-                    "Branch",
-                    "Requester",
-                    "ItemCode",
-                    "ItemName",
-                    "Qty",
-                    "Status",
-                    "Approver",
-                    "LastUpdate",
-                    "Note",
-                    "NotifiedMain(Y/N)",
-                    "NotifiedBranch(Y/N)",
+                    "ReqNo","OrderNo","CreatedAt","Branch","Requester",
+                    "ItemCode","ItemName","Qty","Status","Approver",
+                    "LastUpdate","Note","NotifiedMain(Y/N)","NotifiedBranch(Y/N)",
                 ],
             )
             ensure_headers(
                 ws_noti,
-                ["NotiID", "CreatedAt", "TargetApp", "TargetBranch", "Type", "RefID", "Message", "ReadFlag", "ReadAt"],
+                ["NotiID","CreatedAt","TargetApp","TargetBranch","Type","RefID","Message","ReadFlag","ReadAt"],
             )
 
             order_no = f"ORD-{branch_code}-{datetime.now(TZ).strftime('%Y%m%d-%H%M%S')}"
@@ -543,20 +538,9 @@ def main():
             for _, r in sel.iterrows():
                 req_no = f"REQ-{branch_code}-{datetime.now(TZ).strftime('%Y%m%d-%H%M%S')}"
                 row = [
-                    req_no,
-                    order_no,
-                    ts,
-                    branch_code,
-                    username,
-                    r["รหัส"],
-                    r["ชื่อ"],
-                    str(int(r["จำนวนที่ต้องการ"])),
-                    "pending",
-                    "",
-                    ts,
-                    "",
-                    "N",
-                    "N",
+                    req_no, order_no, ts, branch_code, username,
+                    r["รหัส"], r["ชื่อ"], str(int(r["จำนวนที่ต้องการ"])),
+                    "pending","", ts,"","N","N",
                 ]
                 with_retry(ws_reqs.append_row, row, value_input_option="USER_ENTERED", announce=True)
 
@@ -595,7 +579,7 @@ def main():
     with tab_hist:
         st.header("🧾 ประวัติคำสั่งเบิก (ทุกรายการที่คุณทำเบิก)", anchor=False)
 
-        dfr = read_requests_df()  # โหลดเมื่อผู้ใช้กดแท็บเท่านั้น
+        dfr = read_requests_df()
         if not dfr.empty:
             c_branch = find_col_fuzzy(dfr, {"Branch"})
             c_user   = find_col_fuzzy(dfr, {"Requester"})
@@ -612,7 +596,6 @@ def main():
             if c_branch and c_user and show_cols:
                 my = dfr[(dfr[c_branch] == branch_code) & (dfr[c_user] == username)].copy()
 
-                # แปลงเวลา & เรียงล่าสุดก่อน
                 if c_created in my.columns:
                     my["_dt"] = pd.to_datetime(my[c_created], errors="coerce")
                     my = my.sort_values("_dt", ascending=False).drop(columns=["_dt"])
@@ -620,7 +603,6 @@ def main():
                     if c_order in my.columns:
                         my = my.sort_values(c_order, ascending=False)
 
-                # แสดง Flat list ทั้งหมด
                 pretty = my[show_cols].rename(columns={
                     c_created: "เวลา",
                     c_order:   "ออเดอร์",
@@ -631,7 +613,6 @@ def main():
                 })
                 st.dataframe(pretty, use_container_width=True, height=420)
 
-                # ปุ่มดาวน์โหลด CSV
                 csv = pretty.to_csv(index=False).encode("utf-8-sig")
                 st.download_button(
                     "⬇️ ดาวน์โหลดประวัติ (CSV)",
