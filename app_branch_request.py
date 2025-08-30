@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-WishCo Branch Portal — Phase 1 (Production, Updated)
+WishCo Branch Portal — Phase 1 (Production, Updated for display)
 
 - โหลด Service Account จาก Secrets ได้หลายรูปแบบ
 - รองรับ SHEET_ID / SHEET_URL (หรือวาง URL ครั้งแรกบนหน้า)
 - ล็อกอินสาขา (ทนต่อช่องว่าง/พิมพ์ใหญ่เล็ก)
-- แสดงสต็อก + ฟอร์ม "เบิกอุปกรณ์" → บันทึกลง Requests + แจ้งเตือนใน Notifications
+- แสดงสต็อก: โชว์เฉพาะ “รหัส” และ “ชื่ออุปกรณ์” (ซ่อนคงเหลือ/พร้อมให้เบิก)
+- ฟอร์ม "เบิกอุปกรณ์" → บันทึกลง Requests + แจ้งเตือน Notifications
 """
 
 import os, json, time
@@ -18,12 +19,11 @@ TZ = timezone(timedelta(hours=7))
 
 # ---------- small helpers ----------
 def do_rerun():
-    """Streamlit >=1.32 ใช้ st.rerun(); เก่าๆ ยังมี st.experimental_rerun()"""
     try:
         st.rerun()
     except Exception:
         try:
-            st.experimental_rerun()  # type: ignore[attr-defined]
+            st.experimental_rerun()  # รองรับเวอร์ชันเก่า
         except Exception:
             pass
 
@@ -176,7 +176,7 @@ def main():
     branch_code = st.session_state["user"]["branch"]
     username = st.session_state["user"]["username"]
 
-    # ----- Inventory -----
+    # ----- Inventory (SHOW ONLY code + name) -----
     st.header("📦 คลังสำหรับสาขา")
     dfi = ws_to_df(ws_items)
     if dfi.empty:
@@ -184,27 +184,24 @@ def main():
 
     c_code = find_col(dfi, {"รหัส","ItemCode","Code"})
     c_name = find_col(dfi, {"ชื่อ","Name","รายการ"})
-    c_qty  = find_col(dfi, {"คงเหลือ","Qty","จำนวน"})
-    c_ready= find_col(dfi, {"พร้อมให้เบิก","พร้อมให้เบิก(Y/N)","Ready"})
+    c_qty  = find_col(dfi, {"คงเหลือ","Qty","จำนวน"})   # ยังใช้ในตรรกะได้ ถ้าจำเป็น (แต่ไม่แสดง)
+    c_ready= find_col(dfi, {"พร้อมให้เบิก","พร้อมให้เบิก(Y/N)","Ready"})  # ใช้กรองเท่านั้น ไม่แสดง
 
-    view_df = dfi[[c_code,c_name,c_qty] + ([c_ready] if c_ready else [])].copy()
-    view_df.rename(columns={c_code:"รหัส",c_name:"ชื่อ",c_qty:"คงเหลือ"}, inplace=True)
-    if c_ready: view_df.rename(columns={c_ready:"พร้อมให้เบิก"}, inplace=True)
+    # ตารางมุมมอง: แสดงเฉพาะ "รหัส" + "ชื่อ"
+    view_df = dfi[[c_code, c_name]].copy()
+    view_df.rename(columns={c_code:"รหัส", c_name:"ชื่อ"}, inplace=True)
     st.dataframe(view_df, use_container_width=True, height=420)
 
-    # ----- Request form -----
+    # ----- Request form (label = รหัส — ชื่อ) -----
     st.subheader("📝 เบิกอุปกรณ์")
     ready_df = dfi.copy()
     if c_ready:
         ready_df = ready_df[ready_df[c_ready].astype(str).str.upper().str.strip().isin(["Y","YES","TRUE","1"])]
     if ready_df.empty:
-        st.warning("ยังไม่มีอุปกรณ์ที่พร้อมให้เบิก"); st.stop()
+        st.warning("ยังไม่มีอุปกรณ์ที่พร้อมให้เบิก")
+        st.stop()
 
-    ready_df["_label"] = (
-        ready_df[c_code].astype(str)
-        + " — " + ready_df[c_name].astype(str)
-        + " (คงเหลือ: " + ready_df[c_qty].astype(str) + ")"
-    )
+    ready_df["_label"] = ready_df[c_code].astype(str) + " — " + ready_df[c_name].astype(str)
     choice = st.selectbox("เลือกอุปกรณ์", ready_df["_label"].tolist())
     qty_req = st.number_input("จำนวนที่ต้องการ", min_value=1, step=1, value=1)
     note = st.text_input("หมายเหตุ (ถ้ามี)", value="")
@@ -217,7 +214,6 @@ def main():
         req_no = f"REQ-{branch_code}-{datetime.now(TZ).strftime('%Y%m%d-%H%M%S')}"
         ts = now_str()
 
-        # Requests
         headers = ws_reqs.row_values(1)
         new_rec = {
             "ReqNo": req_no,
@@ -236,7 +232,7 @@ def main():
         }
         ws_reqs.append_row([new_rec.get(h,"") for h in headers], value_input_option="USER_ENTERED")
 
-        # Notifications
+        # แจ้งเตือนให้แอปหลัก
         n_headers = ws_noti.row_values(1)
         noti = {
             "NotiID": f"NOTI-{datetime.now(TZ).strftime('%Y%m%d-%H%M%S')}",
