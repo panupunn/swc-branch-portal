@@ -1,14 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-WishCo Branch Portal — Phase 1 (On-demand + 429-safe, Patched)
+WishCo Branch Portal — Phase 1 (On-demand + 429-safe, Patched with full history)
 
-คุณสมบัติสำคัญ:
-- Login ด้วยชีต Users
-- แสดงรายการอุปกรณ์พร้อมให้เบิก (Items) ในตารางเดียว (เลือก + ระบุจำนวน)
-- สร้าง Order (OrderNo) และบันทึกลงชีต Requests
-- แจ้งเตือนผ่านชีต Notifications (ให้แอปหลักมอนิเตอร์)
-- ประวัติคำสั่งเบิก (History) โหลดเมื่อผู้ใช้กดแท็บเท่านั้น
-- ลดจำนวนการเรียก API ผ่าน cache + exponential backoff + on-demand loading
+- แท็บ "เบิกอุปกรณ์": เลือกอุปกรณ์/จำนวน -> กด "เบิกอุปกรณ์" จะสร้าง OrderNo และบันทึก CreatedAt
+- แท็บ "ประวัติคำสั่งเบิก": แสดง "รายการอุปกรณ์ทุกชิ้น" ที่ผู้ใช้ทำเบิกพร้อม เวลา + ออเดอร์ อ้างอิง
 """
 
 import os, json, time, re, random
@@ -21,7 +16,6 @@ from gspread.exceptions import WorksheetNotFound, APIError
 APP_TITLE = "WishCo Branch Portal — เบิกอุปกรณ์"
 TZ = timezone(timedelta(hours=7))
 
-
 # ====================== Utilities ======================
 def do_rerun():
     try:
@@ -32,10 +26,8 @@ def do_rerun():
         except Exception:
             pass
 
-
 def now_str():
     return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
-
 
 def ensure_headers(ws, headers):
     """ถ้าชีตว่าง ใส่ header ให้, ถ้ามีแล้วและขาดอันไหน เติมท้ายให้"""
@@ -49,14 +41,12 @@ def ensure_headers(ws, headers):
         first += missing
     return first
 
-
 def _norm(s: str) -> str:
     s = str(s or "")
     s = s.strip()
     s = re.sub(r"\s+", "", s)
     s = re.sub(r"[^0-9A-Za-zก-๙]+", "", s)
     return s.lower()
-
 
 def find_col_fuzzy(df, keywords) -> str | None:
     """จับคู่ชื่อคอลัมน์แบบยืดหยุ่น"""
@@ -75,7 +65,6 @@ def find_col_fuzzy(df, keywords) -> str | None:
             if k and (k in norm[h]):
                 return h
     return None
-
 
 # ====================== Credentials & Spreadsheet ======================
 def load_credentials():
@@ -122,7 +111,6 @@ def load_credentials():
     st.error("ไม่พบ Service Account ใน Secrets/Environment")
     st.stop()
 
-
 def _extract_sheet_id(id_or_url: str) -> str | None:
     s = (id_or_url or "").strip()
     if not s:
@@ -133,7 +121,6 @@ def _extract_sheet_id(id_or_url: str) -> str | None:
     if re.fullmatch(r"[a-zA-Z0-9\-_]{20,}", s):
         return s
     return None
-
 
 def open_spreadsheet(client):
     """อ่าน SHEET_ID/SHEET_URL จาก secrets/env; ถ้าไม่ตั้งค่า เปิดช่องให้วาง"""
@@ -160,7 +147,6 @@ def open_spreadsheet(client):
     if sid:
         return _try_open(sid)
 
-    # ยังไม่ตั้งค่า -> ให้ผู้ใช้วาง URL/ID
     st.info("ยังไม่ตั้งค่า SHEET_ID / SHEET_URL — วางลิงก์หรือ Spreadsheet ID")
     inp = st.text_input("URL หรือ Spreadsheet ID", value=st.session_state.get("input_sheet_url", ""))
     if st.button("เชื่อมต่อชีต", type="primary"):
@@ -170,7 +156,6 @@ def open_spreadsheet(client):
         st.session_state["input_sheet_url"] = inp.strip()
         return _try_open(sid2)
     st.stop()
-
 
 # ====================== 429 helpers ======================
 def _is_429(e: Exception) -> bool:
@@ -182,7 +167,6 @@ def _is_429(e: Exception) -> bool:
         return code == 429
     except Exception:
         return False
-
 
 def with_retry(func, *args, announce=False, **kwargs):
     """
@@ -204,7 +188,6 @@ def with_retry(func, *args, announce=False, **kwargs):
                 continue
             raise
 
-
 # ====================== Cached connectors/readers ======================
 @st.cache_resource(show_spinner=False)
 def get_client_and_ss():
@@ -213,14 +196,12 @@ def get_client_and_ss():
     ss = open_spreadsheet(client)
     return client, ss
 
-
 @st.cache_data(ttl=300, show_spinner=False)
 def get_worksheets_map() -> dict:
     """อ่าน metadata แค่ครั้งเดียว แล้วแคช 5 นาที: {title: sheetId}"""
     _, ss = get_client_and_ss()
-    lst = with_retry(ss.worksheets)   # คืนค่ามาเลย (อย่าเรียกซ้ำ)
+    lst = with_retry(ss.worksheets)
     return {w.title: w.id for w in lst}
-
 
 def get_or_create_ws(ss, title: str, rows: int = 1000, cols: int = 26):
     """เปิดแผ่นงานด้วย sheetId ถ้ามี; ถ้าไม่มีให้สร้าง แล้วเคลียร์ mapping"""
@@ -239,7 +220,6 @@ def get_or_create_ws(ss, title: str, rows: int = 1000, cols: int = 26):
             st.stop()
         raise
 
-
 @st.cache_data(ttl=90, show_spinner=False)
 def read_sheet_as_df(sheet_name: str) -> pd.DataFrame:
     """อ่านชีตเป็น DataFrame (cache 90s)"""
@@ -248,7 +228,6 @@ def read_sheet_as_df(sheet_name: str) -> pd.DataFrame:
     vals = with_retry(ws.get_all_values, announce=True)
     return pd.DataFrame(vals[1:], columns=vals[0]) if vals else pd.DataFrame()
 
-
 @st.cache_data(ttl=90, show_spinner=False)
 def read_requests_df() -> pd.DataFrame:
     """อ่านชีต Requests (on-demand)"""
@@ -256,7 +235,6 @@ def read_requests_df() -> pd.DataFrame:
     ws = get_or_create_ws(ss, "Requests", 2000, 26)
     vals = with_retry(ws.get_all_values, announce=True)
     return pd.DataFrame(vals[1:], columns=vals[0]) if vals else pd.DataFrame()
-
 
 # ====================== App ======================
 def main():
@@ -498,7 +476,6 @@ def main():
                 announce=True,
             )
 
-            # refresh cache & UI
             st.cache_data.clear()
             with st.success(f"สร้างคำสั่งเบิกสำเร็จ: **{order_no}**"):
                 st.write("สรุปรายการในออร์เดอร์:")
@@ -512,43 +489,57 @@ def main():
 
     # ===== Tab: ประวัติคำสั่งเบิก =====
     with tab_hist:
-        st.header("🧾 ประวัติคำสั่งเบิก", anchor=False)
+        st.header("🧾 ประวัติคำสั่งเบิก (ทุกรายการที่คุณทำเบิก)", anchor=False)
+
         dfr = read_requests_df()  # โหลดเมื่อผู้ใช้กดแท็บเท่านั้น
         if not dfr.empty:
             c_branch = find_col_fuzzy(dfr, {"Branch"})
-            c_user = find_col_fuzzy(dfr, {"Requester"})
-            c_order = find_col_fuzzy(dfr, {"OrderNo"})
-            c_code2 = find_col_fuzzy(dfr, {"ItemCode", "รหัส"})
-            c_name2 = find_col_fuzzy(dfr, {"ItemName", "ชื่อ"})
-            c_qty2 = find_col_fuzzy(dfr, {"Qty", "จำนวน"})
-            c_status = find_col_fuzzy(dfr, {"Status", "สถานะ"})
-            c_created = find_col_fuzzy(dfr, {"CreatedAt"})
+            c_user   = find_col_fuzzy(dfr, {"Requester"})
+            c_order  = find_col_fuzzy(dfr, {"OrderNo"})
+            c_code2  = find_col_fuzzy(dfr, {"ItemCode","รหัส"})
+            c_name2  = find_col_fuzzy(dfr, {"ItemName","ชื่อ"})
+            c_qty2   = find_col_fuzzy(dfr, {"Qty","จำนวน"})
+            c_status = find_col_fuzzy(dfr, {"Status","สถานะ"})
+            c_created= find_col_fuzzy(dfr, {"CreatedAt","เวลา","timestamp"})
 
-            if c_order and c_branch and c_user:
+            show_cols = [c_created, c_order, c_code2, c_name2, c_qty2, c_status]
+            show_cols = [c for c in show_cols if c]
+
+            if c_branch and c_user and show_cols:
                 my = dfr[(dfr[c_branch] == branch_code) & (dfr[c_user] == username)].copy()
-                if not my.empty:
-                    orders = my[c_order].dropna().unique().tolist()
-                    orders = sorted(orders, reverse=True)
-                    ord_sel = st.selectbox("เลือกออร์เดอร์", orders)
-                    sub = my[my[c_order] == ord_sel].copy()
-                    if c_created:
-                        sub = sub.sort_values(c_created)
-                    show_cols = [c_code2, c_name2, c_qty2, c_status]
-                    show_cols = [c for c in show_cols if c]
-                    st.dataframe(
-                        sub[show_cols].rename(
-                            columns={c_code2: "รหัส", c_name2: "ชื่อ", c_qty2: "Qty", c_status: "สถานะ"}
-                        ),
-                        use_container_width=True,
-                        height=260,
-                    )
+
+                # แปลงเวลา & เรียงล่าสุดก่อน
+                if c_created in my.columns:
+                    my["_dt"] = pd.to_datetime(my[c_created], errors="coerce")
+                    my = my.sort_values("_dt", ascending=False).drop(columns=["_dt"])
                 else:
-                    st.info("ยังไม่มีคำสั่งเบิกของคุณ")
+                    if c_order in my.columns:
+                        my = my.sort_values(c_order, ascending=False)
+
+                # แสดง Flat list ทั้งหมด
+                pretty = my[show_cols].rename(columns={
+                    c_created: "เวลา",
+                    c_order:   "ออเดอร์",
+                    c_code2:   "รหัส",
+                    c_name2:   "ชื่อ",
+                    c_qty2:    "จำนวน",
+                    c_status:  "สถานะ",
+                })
+                st.dataframe(pretty, use_container_width=True, height=420)
+
+                # ปุ่มดาวน์โหลด CSV
+                csv = pretty.to_csv(index=False).encode("utf-8-sig")
+                st.download_button(
+                    "⬇️ ดาวน์โหลดประวัติ (CSV)",
+                    data=csv,
+                    file_name=f"history_{branch_code}_{username}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
             else:
-                st.info("Requests sheet ยังไม่มีคอลัมน์ OrderNo/Branch/Requester ครบถ้วน")
+                st.info("Requests sheet ยังไม่มีคอลัมน์ที่จำเป็น (Branch / Requester / CreatedAt / OrderNo / Item / Qty / Status)")
         else:
             st.info("ยังไม่มีข้อมูลคำสั่งเบิก")
-
 
 if __name__ == "__main__":
     main()
