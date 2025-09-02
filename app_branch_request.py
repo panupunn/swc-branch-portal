@@ -328,7 +328,7 @@ def page_issue():
             "เลือก": st.column_config.CheckboxColumn("เลือก"),
             "รหัส": st.column_config.TextColumn("รหัส", disabled=True),
             "รายการ": st.column_config.TextColumn("รายการ", disabled=True),
-            "จำนวนที่เบิก": st.column_config.NumberColumn("จำนวนที่เบิก", min_value=0, step=1),
+            "จำนวนที่เบิก": st.column_config.NumberColumn("จำนวนที่เบิก", min_value=0, step=1, format="%d"),
             "หน่วย": st.column_config.TextColumn("หน่วย", disabled=True),
         },
         key="issue_table",
@@ -359,22 +359,9 @@ def page_issue():
     if changed:
         _safe_rerun()
 
-    # Helper: increment/decrement buttons per visible row
-    st.caption("ตัวช่วยเพิ่ม/ลดจำนวน (เฉพาะรายการที่กำลังแสดง)")
-    for _, rr in edited.iterrows():
-        code = str(rr["รหัส"]); name = str(rr["รายการ"])
-        qty = int(st.session_state["qty_map"].get(code, 0))
-        col_a, col_b, col_c, col_d = st.columns([0.18,0.52,0.15,0.15])
-        with col_a: st.write(f"**{code}**")
-        with col_b: st.write(name)
-        with col_c:
-            if st.button("－", key=f"dec_{code}"):
-                q = max(0, qty-1); st.session_state["qty_map"][code]=q; _safe_rerun()
-        with col_d:
-            if st.button("＋", key=f"inc_{code}"):
-                q = qty+1; st.session_state["qty_map"][code]=q; _safe_rerun()
 
     # Summary
+
     chosen = edited[(edited["เลือก"] == True) & (edited["จำนวนที่เบิก"] > 0)].copy()
     if not chosen.empty:
         st.subheader("สรุปรายการที่จะเบิก")
