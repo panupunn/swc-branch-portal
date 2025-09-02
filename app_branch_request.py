@@ -334,6 +334,13 @@ def page_issue():
         key="issue_table",
     )
 
+    # Quick actions
+    c_clear, c_sp = st.columns([0.2,0.8])
+    with c_clear:
+        if st.button("ล้างที่เลือกทั้งหมด", use_container_width=True):
+            st.session_state["sel_map"].clear(); st.session_state["qty_map"].clear();
+            _safe_rerun()
+
     # Auto-qty=1 for newly ticked rows
     changed = False
     for i, row in edited.iterrows():
@@ -351,6 +358,21 @@ def page_issue():
 
     if changed:
         _safe_rerun()
+
+    # Helper: increment/decrement buttons per visible row
+    st.caption("ตัวช่วยเพิ่ม/ลดจำนวน (เฉพาะรายการที่กำลังแสดง)")
+    for _, rr in edited.iterrows():
+        code = str(rr["รหัส"]); name = str(rr["รายการ"])
+        qty = int(st.session_state["qty_map"].get(code, 0))
+        col_a, col_b, col_c, col_d = st.columns([0.18,0.52,0.15,0.15])
+        with col_a: st.write(f"**{code}**")
+        with col_b: st.write(name)
+        with col_c:
+            if st.button("－", key=f"dec_{code}"):
+                q = max(0, qty-1); st.session_state["qty_map"][code]=q; _safe_rerun()
+        with col_d:
+            if st.button("＋", key=f"inc_{code}"):
+                q = qty+1; st.session_state["qty_map"][code]=q; _safe_rerun()
 
     # Summary
     chosen = edited[(edited["เลือก"] == True) & (edited["จำนวนที่เบิก"] > 0)].copy()
@@ -434,31 +456,39 @@ def page_issue():
         except Exception as e:
             st.error(f"ไม่สามารถบันทึกคำขอได้: {e}")
 
-    # Recent order history (Requests)
-    st.subheader("ประวัติคำขอ (20 ออเดอร์ล่าสุด)")
+
+    # Recent order history (Requests) with slider and safe empty view
+    st.subheader("ประวัติคำขอ")
+    num_orders = st.slider("จำนวนออเดอร์ล่าสุดที่ต้องการดู", min_value=1, max_value=50, value=5, step=1)
     try:
         ws = _ensure_req_sheet(ss)
         vals = ws.get_all_values()
         if vals and len(vals) > 1:
             df_req = pd.DataFrame(vals[1:], columns=vals[0])
             df_req = _normalize(df_req)
+            # Ensure required cols exist
+            for col in ["username","requestid","qty","requesttime"]:
+                if col not in df_req.columns:
+                    df_req[col] = "" if col != "qty" else 0
             # keep only current user
-            df_req = df_req[df_req["username"].astype(str).str.lower() == str(user.get("username","")).lower()]
+            me = str(user.get("username","")).lower()
+            df_req = df_req[df_req["username"].astype(str).str.lower() == me]
             if not df_req.empty and "requestid" in df_req.columns:
+                # coerce qty to numeric safely
+                df_req["qty_num"] = pd.to_numeric(df_req["qty"], errors="coerce").fillna(0.0)
                 grp = (df_req
                        .groupby(["requestid"], as_index=False)
-                       .agg({"qty": lambda s: sum([float(x) if str(x).replace('.','',1).isdigit() else 0 for x in s]),
-                             "requesttime": "max"})
+                       .agg({"qty_num":"sum","requesttime":"max"})
                        .sort_values("requesttime", ascending=False)
-                       .head(20))
-                grp = grp.rename(columns={"requestid":"เลขที่ออเดอร์","qty":"จำนวนรวม","requesttime":"เวลา"})
+                       .head(num_orders))
+                grp = grp.rename(columns={"requestid":"เลขที่ออเดอร์","qty_num":"จำนวนรวม","requesttime":"เวลา"})
                 st.dataframe(grp, use_container_width=True, hide_index=True)
             else:
-                st.info("ยังไม่มีคำขอของผู้ใช้นี้")
+                st.dataframe(pd.DataFrame(columns=["เลขที่ออเดอร์","จำนวนรวม","เวลา"]), use_container_width=True, hide_index=True)
         else:
-            st.info("ยังไม่มีคำขอ")
+            st.dataframe(pd.DataFrame(columns=["เลขที่ออเดอร์","จำนวนรวม","เวลา"]), use_container_width=True, hide_index=True)
     except Exception as e:
-        st.error(f"อ่านประวัติคำขอไม่สำเร็จ: {e}")
+        st.dataframe(pd.DataFrame(columns=["เลขที่ออเดอร์","จำนวนรวม","เวลา"]), use_container_width=True, hide_index=True)
 
 
 def main():
