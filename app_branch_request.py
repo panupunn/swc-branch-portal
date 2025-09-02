@@ -2,28 +2,27 @@
 # -*- coding: utf-8 -*-
 """
 WishCo Branch Portal — เบิกอุปกรณ์
-Table UI + Requests sheet integration + persistent OrderID
+Summary table editable with in-cell +/- (AgGrid), Requests history slider, clear-all.
 
-Version: v2025-09-02f
+Version: v2025-09-02g
 
-Changes from v4:
-- After confirm, write rows to a new sheet **Requests** so that the main app ("คำขอเบิก (จากสาขา)") can see them.
-- OrderID format: USERNAME+YYMMDD-XX (daily running per user). Running number derived from **Requests** (not Transactions).
-- Show success message with OrderID **without immediate rerun**, so it doesn't disappear.
-- Add "ประวัติคำขอ (20 ออเดอร์ล่าสุด)" table sourced from **Requests** grouped by RequestID.
-- Keep Transactions writing optional for internal history; enabled by default.
-- By default, DO NOT deduct stock when submitting requests (set `DEDUCT_STOCK_ON_REQUEST=False`).
-
-Other existing features:
-- Login fixes; flexible Users headers; bcrypt-first verify; compact Health Check.
-- Table UI with checkbox + auto qty=1 on first tick.
+Requirements (add to requirements.txt):
+- streamlit-aggrid>=0.3.4
 """
+
 from __future__ import annotations
 import os, json, time
 from typing import Dict, Any, List, Optional
 
 import streamlit as st
 import pandas as pd
+
+# Optional dependency
+try:
+    from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode  # type: ignore
+    HAS_AGGRID = True
+except Exception:
+    HAS_AGGRID = False
 
 try:
     import gspread  # type: ignore
@@ -307,7 +306,7 @@ def page_issue():
         s = q.strip().lower()
         items = items[ items["itemname"].astype(str).str.lower().str.contains(s) | items["itemcode"].astype(str).str.lower().str.contains(s) ]
 
-    # Build table for editor (hide stock)
+    # Build table for editor (hide stock in UI)
     codes = items["itemcode"].astype(str).tolist()
     sel_defaults = [bool(st.session_state["sel_map"].get(c, False)) for c in codes]
     qty_defaults = [int(st.session_state["qty_map"].get(c, 0)) for c in codes]
@@ -334,13 +333,6 @@ def page_issue():
         key="issue_table",
     )
 
-    # Quick actions
-    c_clear, c_sp = st.columns([0.2,0.8])
-    with c_clear:
-        if st.button("ล้างที่เลือกทั้งหมด", use_container_width=True):
-            st.session_state["sel_map"].clear(); st.session_state["qty_map"].clear();
-            _safe_rerun()
-
     # Auto-qty=1 for newly ticked rows
     changed = False
     for i, row in edited.iterrows():
@@ -359,13 +351,95 @@ def page_issue():
     if changed:
         _safe_rerun()
 
-
     # Summary
-
     chosen = edited[(edited["เลือก"] == True) & (edited["จำนวนที่เบิก"] > 0)].copy()
     if not chosen.empty:
         st.subheader("สรุปรายการที่จะเบิก")
-        st.dataframe(chosen[["รหัส","รายการ","จำนวนที่เบิก","หน่วย"]], hide_index=True, use_container_width=True)
+
+        sum_df = chosen[["รหัส","รายการ","จำนวนที่เบิก","หน่วย"]].copy()
+        sum_df["จำนวนที่เบิก"] = sum_df["จำนวนที่เบิก"].astype(int)
+
+        if HAS_AGGRID:
+            # Build AgGrid with +/- cell renderer
+            gb = GridOptionsBuilder.from_dataframe(sum_df, editable=True)
+            js_plus_minus = JsCode("""
+            class QtyRenderer {
+              init(params){
+                this.params = params;
+                this.eGui = document.createElement('div');
+                const val = Number(params.value || 0);
+                this.eGui.style.display = 'flex';
+                this.eGui.style.alignItems = 'center';
+                this.eGui.style.justifyContent = 'flex-end';
+                this.eGui.style.gap = '6px';
+                const btnMinus = document.createElement('button');
+                btnMinus.innerText = '−';
+                btnMinus.style.padding = '2px 8px';
+                btnMinus.style.border = '1px solid #ccc';
+                btnMinus.style.borderRadius = '6px';
+                btnMinus.addEventListener('click', ()=>{
+                  const cur = Number(this.params.value || 0);
+                  const next = Math.max(0, cur - 1);
+                  this.params.setValue(next);
+                });
+                const span = document.createElement('span');
+                span.innerText = val.toString();
+                span.style.minWidth = '20px';
+                span.style.textAlign = 'center';
+                const btnPlus = document.createElement('button');
+                btnPlus.innerText = '+';
+                btnPlus.style.padding = '2px 8px';
+                btnPlus.style.border = '1px solid #ccc';
+                btnPlus.style.borderRadius = '6px';
+                btnPlus.addEventListener('click', ()=>{
+                  const cur = Number(this.params.value || 0);
+                  const next = cur + 1;
+                  this.params.setValue(next);
+                });
+                this.eGui.appendChild(btnMinus);
+                this.eGui.appendChild(span);
+                this.eGui.appendChild(btnPlus);
+                this.span = span;
+              }
+              getGui(){ return this.eGui; }
+              refresh(params){
+                this.span.innerText = String(params.value || 0);
+                return true;
+              }
+            }
+            """)
+            gb.configure_column("รหัส", editable=False, width=120)
+            gb.configure_column("รายการ", editable=False)
+            gb.configure_column("หน่วย", editable=False, width=100)
+            gb.configure_column("จำนวนที่เบิก", editable=True, width=160,
+                                cellRenderer=js_plus_minus, valueParser=JsCode("function(x){return Number(x.newValue)||0;}"))
+            gb.configure_grid_options(domLayout='autoHeight', suppressClickEdit=False)
+            grid = AgGrid(
+                sum_df,
+                gridOptions=gb.build(),
+                update_mode=GridUpdateMode.VALUE_CHANGED,
+                allow_unsafe_jscode=True,
+                fit_columns_on_grid_load=True,
+            )
+            updated = pd.DataFrame(grid["data"])
+            # persist back to session qty_map
+            for _, r in updated.iterrows():
+                st.session_state["qty_map"][str(r["รหัส"])] = int(r["จำนวนที่เบิก"] or 0)
+            st.dataframe(pd.DataFrame(), height=1)  # slight spacer
+        else:
+            st.warning("ต้องติดตั้งแพ็คเกจ streamlit-aggrid เพื่อใช้ปุ่ม − / + ในเซลล์ (จะใช้ตัวแก้ตัวเลขธรรมดาชั่วคราว)")
+            sum_df = st.data_editor(
+                sum_df, hide_index=True, use_container_width=True,
+                column_config={
+                    "รหัส": st.column_config.TextColumn("รหัส", disabled=True),
+                    "รายการ": st.column_config.TextColumn("รายการ", disabled=True),
+                    "จำนวนที่เบิก": st.column_config.NumberColumn("จำนวนที่เบิก", min_value=0, step=1, format="%d"),
+                    "หน่วย": st.column_config.TextColumn("หน่วย", disabled=True),
+                },
+                key="summary_editor",
+            )
+            for _, r in sum_df.iterrows():
+                st.session_state["qty_map"][str(r["รหัส"])] = int(r["จำนวนที่เบิก"] or 0)
     else:
         st.info("ยังไม่เลือกรายการ")
 
@@ -374,42 +448,36 @@ def page_issue():
         # Validate vs stock silently
         full_items = _read_items_df(ss)
         insufficient = []
-        for _, r in chosen.iterrows():
-            code = str(r["รหัส"]); qty = int(r["จำนวนที่เบิก"])
+        # Use session qty_map to ensure latest from summary grid
+        current_map = st.session_state.get("qty_map", {})
+        codes = [str(c) for c in chosen["รหัส"].tolist()]
+        pairs = [(c, int(current_map.get(c, 0))) for c in codes if int(current_map.get(c, 0)) > 0]
+        if not pairs:
+            st.error("ไม่มีจำนวนที่เบิก"); return
+        for code, qty in pairs:
             have = float(full_items[full_items["itemcode"].astype(str)==code].head(1).get("stock", pd.Series([0])).iloc[0] or 0)
             if qty > have:
                 name = str(full_items[full_items["itemcode"].astype(str)==code].head(1).get("itemname", pd.Series([""])).iloc[0])
                 insufficient.append((code, name, have, qty))
         if insufficient:
-            st.error("สต็อกไม่พอ: " + ", ".join([f"{c} ({have} < {need})" for c,_,have,need in insufficient])); return
+            st.error("สต็อกไม่พอ: " + ", ".join([f\"{c} ({have} < {need})\" for c,_,have,need in insufficient])); return
 
         order_id = _generate_order_id_from_requests(ss, user.get("username",""))
         now = time.strftime("%Y-%m-%d %H:%M:%S")
 
-        # Build request rows
-        req_rows = []
-        for _, r in chosen.iterrows():
-            code = str(r["รหัส"]); qty = int(r["จำนวนที่เบิก"])
+        # Build rows
+        req_rows, tx_rows = [], []
+        for code, qty in pairs:
             item_row = full_items[full_items["itemcode"].astype(str)==code].head(1).iloc[0]
             req_rows.append([ now, order_id, user.get("username",""), user.get("branch_code",""),
                               item_row.get("itemcode"), item_row.get("itemname"), qty, "Pending", "" ])
-
-        # Build transaction rows (optional)
-        tx_rows = []
-        if WRITE_TRANSACTIONS:
-            for _, r in chosen.iterrows():
-                code = str(r["รหัส"]); qty = int(r["จำนวนที่เบิก"])
-                item_row = full_items[full_items["itemcode"].astype(str)==code].head(1).iloc[0]
+            if WRITE_TRANSACTIONS:
                 tx_rows.append([ now, order_id, user.get("username",""), user.get("branch_code",""),
                                  item_row.get("itemcode"), item_row.get("itemname"), qty, "REQ", "" ])
-
         try:
             _append_req(ss, req_rows)
-            if WRITE_TRANSACTIONS and tx_rows:
-                _append_tx(ss, tx_rows)
-
+            if WRITE_TRANSACTIONS and tx_rows: _append_tx(ss, tx_rows)
             if DEDUCT_STOCK_ON_REQUEST:
-                # Update stock immediately (optional)
                 ws = ss.worksheet("Items")
                 values = ws.get_all_values()
                 header = values[0] if values else ["ItemCode","ItemName","Stock","Unit","Category","Active"]
@@ -427,8 +495,7 @@ def page_issue():
                     c = str(row_vals[code_idx]).strip() if len(row_vals)>code_idx else ""
                     if c: code_to_row[c] = rn
                 batch = []
-                for _, r in chosen.iterrows():
-                    code = str(r["รหัส"]); qty = int(r["จำนวนที่เบิก"])
+                for code, qty in pairs:
                     have = float(full_items[full_items["itemcode"].astype(str)==code].iloc[0].get("stock") or 0)
                     new_stock = have - qty
                     rn = code_to_row.get(code)
@@ -439,12 +506,10 @@ def page_issue():
             st.success(f"ส่งคำขอเบิกเรียบร้อย เลขที่ออเดอร์: **{order_id}** | รายการ: {len(req_rows)}")
             st.info("คำขอถูกบันทึกลงชีต 'Requests' เรียบร้อยแล้ว (สถานะ: Pending)")
             st.session_state["sel_map"].clear(); st.session_state["qty_map"].clear()
-
         except Exception as e:
             st.error(f"ไม่สามารถบันทึกคำขอได้: {e}")
 
-
-    # Recent order history (Requests) with slider and safe empty view
+    # History with slider and safe empty view
     st.subheader("ประวัติคำขอ")
     num_orders = st.slider("จำนวนออเดอร์ล่าสุดที่ต้องการดู", min_value=1, max_value=50, value=5, step=1)
     try:
@@ -453,15 +518,12 @@ def page_issue():
         if vals and len(vals) > 1:
             df_req = pd.DataFrame(vals[1:], columns=vals[0])
             df_req = _normalize(df_req)
-            # Ensure required cols exist
             for col in ["username","requestid","qty","requesttime"]:
                 if col not in df_req.columns:
                     df_req[col] = "" if col != "qty" else 0
-            # keep only current user
             me = str(user.get("username","")).lower()
             df_req = df_req[df_req["username"].astype(str).str.lower() == me]
             if not df_req.empty and "requestid" in df_req.columns:
-                # coerce qty to numeric safely
                 df_req["qty_num"] = pd.to_numeric(df_req["qty"], errors="coerce").fillna(0.0)
                 grp = (df_req
                        .groupby(["requestid"], as_index=False)
@@ -474,7 +536,7 @@ def page_issue():
                 st.dataframe(pd.DataFrame(columns=["เลขที่ออเดอร์","จำนวนรวม","เวลา"]), use_container_width=True, hide_index=True)
         else:
             st.dataframe(pd.DataFrame(columns=["เลขที่ออเดอร์","จำนวนรวม","เวลา"]), use_container_width=True, hide_index=True)
-    except Exception as e:
+    except Exception:
         st.dataframe(pd.DataFrame(columns=["เลขที่ออเดอร์","จำนวนรวม","เวลา"]), use_container_width=True, hide_index=True)
 
 
@@ -489,6 +551,9 @@ def main():
             st.session_state["auth"] = False; st.session_state["user"] = {}; st.session_state["sel_map"] = {}; st.session_state["qty_map"] = {}; st.session_state["last_order_id"] = ""
             st.success("ออกจากระบบแล้ว"); _safe_rerun()
         else:
+            # Quick actions
+            if st.sidebar.button("ล้างที่เลือกทั้งหมด", use_container_width=True):
+                st.session_state["sel_map"].clear(); st.session_state["qty_map"].clear(); _safe_rerun()
             page_issue()
     else:
         menu = st.sidebar.radio("เมนู", options=["เข้าสู่ระบบ","Health Check"], index=0)
