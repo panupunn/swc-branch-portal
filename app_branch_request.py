@@ -67,7 +67,7 @@ def _normalize(df: pd.DataFrame) -> pd.DataFrame:
 
 def _ensure_session():
     for k, v in [("auth", False), ("user", {}),
-                 ("sel_map", {}), ("qty_map", {}), ("last_order_id", "")]:
+                 ("sel_map", {}), ("qty_map", {}), ("last_order_id", ""), ("recent_request_snap", None)]:
         if k not in st.session_state: st.session_state[k] = v
 
 def _safe_rerun():
@@ -429,6 +429,14 @@ def _requests_and_history_tabs(ss, user):
 
                     show = grp.rename(columns={c_id:"เลขที่ออเดอร์"})[["ไอคอน","เลขที่ออเดอร์","รายการ","จำนวนรวม","สถานะ","เวลา"]].copy()
                     show["จำนวนรวม"] = show["จำนวนรวม"].astype(int)
+                                        # merge with snapshot to ensure immediate visibility of just-submitted order
+                    snap = st.session_state.get("recent_request_snap")
+                    if snap is not None:
+                        try:
+                            if snap["เลขที่ออเดอร์"] not in show["เลขที่ออเดอร์"].astype(str).tolist():
+                                show = pd.concat([pd.DataFrame([snap]), show], ignore_index=True)
+                        except Exception:
+                            pass
                     st.dataframe(show, use_container_width=True, hide_index=True)
 
                     pending_ids = show[show["สถานะ"]=="Pending"]["เลขที่ออเดอร์"].tolist()
@@ -497,6 +505,19 @@ def _requests_and_history_tabs(ss, user):
                 cols["ประเภท"] = df.get("type","")
                 cols["หมายเหตุ"] = df.get("note","")
                 out = pd.DataFrame(cols)
+                # join status from Requests (aggregate per RequestID)
+                try:
+                    ws_req = _requests_ws(ss)
+                    vals_req = ws_req.get_all_values()
+                    if vals_req and len(vals_req)>1:
+                        dfr = pd.DataFrame(vals_req[1:], columns=vals_req[0])
+                        dfr = _normalize(dfr)
+                        if "requestid" in dfr.columns and "status" in dfr.columns:
+                            grp = (dfr.groupby(["requestid"], as_index=False)
+                                     .agg(สถานะ=("status", lambda s: ("Canceled" if any(str(x).strip().lower() in ("canceled","cancelled") for x in s) else ("Approved" if any(str(x).strip().lower()=="approved" for x in s) else "Pending")))) )
+                            out = out.merge(grp.rename(columns={"requestid":"เลขที่TX"}), how="left", on="เลขที่TX")
+                except Exception:
+                    pass
                 out = out.tail(num2)
                 st.dataframe(out, use_container_width=True, hide_index=True)
         except Exception:
@@ -573,6 +594,19 @@ def page_issue():
                 st.session_state["last_order_id"] = order_id
                 st.success(f"ส่งคำขอเบิกเรียบร้อย เลขที่ออเดอร์: {order_id} | รายการ: {len(req_rows)}")
                 st.info("คำขอถูกบันทึกลงชีต 'Requests' เรียบร้อยแล้ว (สถานะ: Pending)")
+                # build snapshot for immediate display in Recent tab
+                try:
+                    snap_series = {
+                        "ไอคอน": "🟡",
+                        "เลขที่ออเดอร์": order_id,
+                        "รายการ": ", ".join([f"{r[5]} ({int(r[6])})" for r in req_rows]),
+                        "จำนวนรวม": int(sum(int(r[6]) for r in req_rows)),
+                        "สถานะ": "Pending",
+                        "เวลา": now,
+                    }
+                    st.session_state["recent_request_snap"] = snap_series
+                except Exception:
+                    pass
                 st.session_state["sel_map"].clear(); st.session_state["qty_map"].clear()
             except Exception as e:
                 st.error(f"บันทึกคำขอไม่สำเร็จ: {e}")
