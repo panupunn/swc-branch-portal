@@ -311,7 +311,6 @@ def page_issue():
 
     if changed:
         # force redraw so the user sees qty=1 instantly
-        st.session_state["issue_table"] = edited
         _safe_rerun()
 
     # Summary
