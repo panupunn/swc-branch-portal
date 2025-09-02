@@ -483,8 +483,8 @@ def page_issue():
                 insufficient.append((code, name, have, qty))
         if insufficient:
             msg = "สต็อกไม่พอ: " + ", ".join([f"{c} ({have} < {need})" for c, _, have, need in insufficient])
-        st.error(msg)
-        return
+            st.error(msg)
+            return
 
         order_id = _generate_order_id_from_requests(ss, user.get("username",""))
         now = time.strftime("%Y-%m-%d %H:%M:%S")
