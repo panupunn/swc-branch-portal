@@ -31,6 +31,33 @@ APP_TITLE = "WishCo Branch Portal — เบิกอุปกรณ์"
 TZ = timezone(timedelta(hours=7))
 
 # ====================== Utilities ======================
+
+# ---- Ensure Users sheet headers standard ----
+def ensure_users_headers():
+    try:
+        client, ss = get_client_and_ss()
+        try:
+            ws = ss.worksheet("Users")
+        except WorksheetNotFound:
+            ws = ss.add_worksheet("Users", rows=100, cols=10)
+        desired = ["Username","BranchCode","Password","PasswordHash","DisplayName"]
+        vals = with_retry(ws.get_values, "A1:E1")
+        header = [c.strip() for c in (vals[0] if vals else [])]
+        def _norm(x): return re.sub(r"\s+","", str(x or "")).strip().lower()
+        expected = {_norm(h) for h in desired}
+        actual = {_norm(h) for h in header if h}
+        if not actual or not (actual & expected):
+            with_retry(ws.update, "A1:E1", [desired])
+            try:
+                st.cache_data.clear()
+            except Exception:
+                pass
+            return True
+        return False
+    except Exception as e:
+        st.warning(f"Ensure Users header failed: {e}")
+        return False
+
 def do_rerun():
     try:
         st.rerun()
@@ -237,50 +264,85 @@ def read_requests_df() -> pd.DataFrame:
     ws = get_or_create_ws(ss, "Requests", 2000, 26)
     vals = with_retry(ws.get_all_values, announce=True)
     return pd.DataFrame(vals[1:], columns=vals[0]) if vals else pd.DataFrame()
-def ensure_users_headers():
-    """Ensure Users sheet has at least the standard headers.
-    It creates the worksheet if missing and writes header row if empty or malformed.
-    """
-    try:
-        _, ss = get_client_and_ss()
-        ws = get_or_create_ws(ss, "Users", 1000, 10)
-        # peek values
-        vals = with_retry(ws.get_all_values, announce=False)
-        desired = ["Username","BranchCode","Password","PasswordHash","DisplayName"]
-        if not vals:
-            # empty sheet: write header
-            with_retry(ws.update, "A1:E1", [desired])
-            st.cache_data.clear()
-            return True
-        # has some data; check header row
-        header = [c.strip() for c in (vals[0] if vals else [])]
-        # if every header cell blank or not matching any expected keywords, write desired
-        def _norm(x): return re.sub(r"\s+", "", str(x or "")).strip().lower()
-        expected_norms = { _norm(h) for h in desired }
-        header_norms = [ _norm(h) for h in header ]
-        if not any(header_norms) or not any(h in expected_norms for h in header_norms):
-            with_retry(ws.update, "A1:E1", [desired])
-            st.cache_data.clear()
-            return True
-    except Exception:
-        # Don't hard fail login on header fix; show details in expander
-        st.warning("ตรวจพบ Users sheet ไม่สมบูรณ์: ระบบพยายามตั้งหัวตารางให้อัตโนมัติ")
-    return False
-
 
 # ====================== App ======================
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
-    st.title(APP_TITLE)
-
-    client, ss = get_client_and_ss()
+    
+# ---------- Health Check Page ----------
+def render_health_check():
+    st.header("🩺 Health Check — การเชื่อมต่อและโครงสร้างสเปรดชีต", anchor=False)
+    # Secrets keys
     try:
-        st.caption(f"Service Account: `{client.auth.service_account_email}`")
+        keys = list(st.secrets.keys())
+        st.info("พบคีย์ใน secrets.toml: " + ", ".join(f"`{k}`" for k in keys))
+    except Exception as e:
+        st.error(f"โหลด secrets ไม่ได้: {e}")
+    # Connect
+    try:
+        client, ss = get_client_and_ss()
+        st.success(f"เชื่อมต่อได้: **{ss.title}**")
+        st.caption(f"Spreadsheet ID: `{ss.id}`")
+    except Exception as e:
+        st.exception(e); st.stop()
+    # Worksheets
+    required = ["Users","Items","Requests"]
+    try:
+        ws_names = [w.title for w in ss.worksheets()]
+    except Exception as e:
+        ws_names = []; st.warning(f"อ่านรายชื่อแท็บไม่ได้: {e}")
+    cols = st.columns(2)
+    with cols[0]: st.write("Worksheets:", ws_names or "—")
+    with cols[1]:
+        missing = [w for w in required if w not in ws_names]
+        st.success("มีแท็บหลักครบ") if not missing else st.error("ขาด: " + ", ".join(missing))
+    # Users header
+    try:
+        ws_u = ss.worksheet("Users")
     except Exception:
-        pass
+        ws_u = None
+    if ws_u:
+        vals = with_retry(ws_u.get_values, "A1:E1")
+        header = [c.strip() for c in (vals[0] if vals else [])]
+        st.write("Users header:", header)
+        desired = ["Username","BranchCode","Password","PasswordHash","DisplayName"]
+        need_fix = not header or not any(h.strip() for h in header) or not set(h.lower() for h in header) & set(h.lower() for h in desired)
+        if need_fix and st.button("🛠️ แก้หัวตาราง Users"):
+            with_retry(ws_u.update, "A1:E1", [desired])
+            st.success("อัปเดตหัว Users แล้ว")
+        if st.button("➕ สร้างผู้ใช้ตัวอย่าง (swc001 / 1234)"):
+            try:
+                ensure_users_headers()
+                dfu = read_sheet_as_df("Users")
+            except Exception:
+                dfu = pd.DataFrame()
+            except Exception:
+                dfu = pd.DataFrame()
+            seen = False
+            if not dfu.empty:
+                cu = find_col_fuzzy(dfu, {"username","user","ชื่อผู้ใช้"})
+                if cu: seen = dfu[cu].astype(str).str.casefold().eq("swc001").any()
+            if not seen:
+                with_retry(ws_u.append_row, ["swc001","SWC001","1234","","สาขาทดสอบ 001"], value_input_option="USER_ENTERED")
+                st.success("เพิ่มผู้ใช้ตัวอย่างแล้ว")
+            else:
+                st.info("มีผู้ใช้ swc001 อยู่แล้ว")
+    st.caption("เคล็ดลับ: Health Check ใช้ซ่อมโครงสร้าง Users/สิทธิ์เบื้องต้นก่อนล็อกอิน")
 
-    # ---------- Login ----------
+st.title(APP_TITLE)
+
+client, ss = get_client_and_ss()
+try:
+    st.caption(f"Service Account: `{client.auth.service_account_email}`")
+except Exception:
+    pass
+
+# ---------- Login ----------
     st.sidebar.subheader("เข้าสู่ระบบสำหรับสาขา/หน่วยงาน")
+    page_choice = st.sidebar.radio("เมนู", ["เข้าสู่ระบบ", "🩺 Health Check"], index=0)
+    if page_choice == "🩺 Health Check":
+        render_health_check()
+        st.stop()
     if "auth" not in st.session_state:
         st.session_state["auth"] = False
         st.session_state["user"] = {}
@@ -304,8 +366,6 @@ def main():
             # normalize present columns
             for c in filter(None, (cu, cp, cph, cb)):
                 dfu[c] = dfu[c].astype(str).str.strip()
-
-            # select row by username (case-insensitive)
             row = dfu[dfu[cu].str.casefold() == (u or "").strip().casefold()].head(1)
             if row.empty:
                 st.sidebar.error("ไม่พบผู้ใช้หรือรหัสผ่านไม่ถูกต้อง")
@@ -333,8 +393,7 @@ def main():
                     }
                     st.sidebar.success(f"ยินดีต้อนรับ {st.session_state['user']['username']}")
                     time.sleep(0.5); do_rerun()
-            st.stop()
-
+        st.stop()
 
     if st.sidebar.button("ออกจากระบบ"):
         st.session_state["auth"] = False
