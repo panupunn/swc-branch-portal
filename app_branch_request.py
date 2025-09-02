@@ -228,8 +228,26 @@ def get_or_create_ws(ss, title: str, rows: int = 1000, cols: int = 26):
 def read_sheet_as_df(sheet_name: str) -> pd.DataFrame:
     _, ss = get_client_and_ss()
     ws = get_or_create_ws(ss, sheet_name, 1000, 26)
+    # ถ้าเป็นชีต Users ให้สร้าง/เติมหัวคอลัมน์ที่จำเป็นโดยอัตโนมัติ
+    if sheet_name.strip().lower() == "users":
+        required_headers = ["Username","BranchCode","Password","PasswordHash","DisplayName"]
+        try:
+            ensure_headers(ws, required_headers)
+        except Exception:
+            pass
     vals = with_retry(ws.get_all_values, announce=True)
-    return pd.DataFrame(vals[1:], columns=vals[0]) if vals else pd.DataFrame()
+    if not vals:
+        # ถ้าเป็น Users และยังไม่มีข้อมูล ให้คืน DataFrame พร้อมคอลัมน์มาตรฐาน
+        if sheet_name.strip().lower() == "users":
+            return pd.DataFrame(columns=["Username","BranchCode","Password","PasswordHash","DisplayName"])
+        return pd.DataFrame()
+    # กันกรณี header ว่าง
+    if not vals[0]:
+        if sheet_name.strip().lower() == "users":
+            vals[0] = ["Username","BranchCode","Password","PasswordHash","DisplayName"]
+        else:
+            vals[0] = [f"C{i+1}" for i in range(len(vals[1]) if len(vals)>1 else 0)]
+    return pd.DataFrame(vals[1:], columns=vals[0])
 
 @st.cache_data(ttl=90, show_spinner=False)
 def read_requests_df() -> pd.DataFrame:
@@ -273,14 +291,11 @@ def main():
             # normalize present columns
             for c in filter(None, (cu, cp, cph, cb)):
                 dfu[c] = dfu[c].astype(str).str.strip()
-
-            # ค้นหาแถวผู้ใช้จากชื่อผู้ใช้ (ไม่สนตัวพิมพ์เล็ก/ใหญ่)
             row = dfu[dfu[cu].str.casefold() == (u or "").strip().casefold()].head(1)
             if row.empty:
                 st.sidebar.error("ไม่พบผู้ใช้หรือรหัสผ่านไม่ถูกต้อง")
             else:
                 ok = False
-                # 1) ถ้ามีคอลัมน์รหัสผ่านแบบแฮช และติดตั้ง bcrypt ให้ตรวจสอบแบบแฮชก่อน
                 try:
                     if cph and str(row.iloc[0][cph]).strip():
                         if bcrypt:
@@ -290,23 +305,19 @@ def main():
                                 ok = False
                 except Exception:
                     ok = False
-
-                # 2) ถ้ายังไม่ผ่าน และมีคอลัมน์รหัสผ่านแบบข้อความ ให้เทียบตรง ๆ
                 if not ok and cp:
                     if str(row.iloc[0][cp]).strip() == (p or "").strip():
                         ok = True
-
                 if not ok:
                     st.sidebar.error("ไม่พบผู้ใช้หรือรหัสผ่านไม่ถูกต้อง")
                 else:
-                    # ตั้งค่า session เมื่อเข้าสู่ระบบสำเร็จ
-                    st.session_state["auth"] = True
-                    st.session_state["user"] = {
-                        "username": (u or "").strip(),
-                        "branch": str(row.iloc[0][cb]).strip(),
-                    }
-                    st.sidebar.success(f"ยินดีต้อนรับ {st.session_state['user']['username']}")
-                    time.sleep(0.5); do_rerun()
+                st.session_state["auth"] = True
+                st.session_state["user"] = {
+                    "username": (u or "").strip(),
+                    "branch": str(row.iloc[0][cb]).strip(),
+                }
+                st.sidebar.success(f"ยินดีต้อนรับ {st.session_state['user']['username']}")
+                time.sleep(0.5); do_rerun()
         st.stop()
 
     if st.sidebar.button("ออกจากระบบ"):
