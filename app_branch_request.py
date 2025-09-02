@@ -1,5 +1,11 @@
 # -*- coding: utf-8 -*-
 """
+import os, re, time, json
+try:
+    import bcrypt
+except Exception:
+    bcrypt = None
+
 WishCo Branch Portal — Phase 1 (patched with compact right-aligned +/- control)
 - เลือกรายการหลายชิ้นในครั้งเดียว (OrderNo เดียว)
 - บล็อก "ปรับจำนวนอย่างรวดเร็ว" แบบกล่องยาว มีปุ่ม − (เทา) และ + (แดง) ชิดขวา ตามภาพตัวอย่าง
