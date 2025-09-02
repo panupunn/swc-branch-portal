@@ -519,6 +519,7 @@ def page_issue():
         except Exception as e:
             st.error(f"ไม่สามารถบันทึกคำขอได้: {e}")
 
+
     # คำขอที่ถูกบันทึกลงชีต 'Requests' พร้อมไอคอนสถานะ และปุ่มยกเลิกเมื่อ Pending
     st.subheader("คำขอที่ส่งไป (ล่าสุด)")
     num_orders = st.slider("จำนวนออเดอร์ล่าสุดที่ต้องการดู", min_value=1, max_value=50, value=5, step=1)
@@ -526,22 +527,23 @@ def page_issue():
         ws = _ensure_req_sheet(ss)
         vals = ws.get_all_values()
         if vals and len(vals) > 1:
-            df_req_raw = pd.DataFrame(vals[1:], columns=vals[0])
-            df_req = _normalize(df_req_raw)
-            # coerce qty
+            df_req = pd.DataFrame(vals[1:], columns=vals[0])
+            df_req = _normalize(df_req)
+            # เฉพาะของผู้ใช้ปัจจุบัน
+            me = str(user.get("username","")).lower()
+            if "username" in df_req.columns:
+                df_req = df_req[df_req["username"].astype(str).str.lower() == me]
+            # qty เป็นตัวเลข
             if "qty" in df_req.columns:
                 df_req["qty_num"] = pd.to_numeric(df_req["qty"], errors="coerce").fillna(0).astype(float)
             else:
                 df_req["qty_num"] = 0.0
-            me = str(user.get("username","")).lower()
-            df_req = df_req[df_req.get("username","").astype(str).str.lower() == me]
-            # Build 'รายการ' เป็นชื่อ + (qty) คั่นด้วย comma
-            if not df_req.empty:
+            if not df_req.empty and "requestid" in df_req.columns:
                 df_req["pair"] = df_req.get("itemname","").astype(str) + " (" + df_req["qty_num"].astype(int).astype(str) + ")"
                 def agg_status(g):
-                    statuses = set(str(x).strip().lower() for x in g.get("status","").astype(str))
-                    if "canceled" in statuses or "cancelled" in statuses: return "Canceled"
-                    if "approved" in statuses or "อนุมัติ" in statuses: return "Approved"
+                    sset = set(str(x).strip().lower() for x in g.get("status","").astype(str))
+                    if "canceled" in sset or "cancelled" in sset: return "Canceled"
+                    if "approved" in sset or "อนุมัติ" in sset: return "Approved"
                     return "Pending"
                 grp = (df_req
                        .groupby(["requestid"], as_index=False)
@@ -549,66 +551,51 @@ def page_issue():
                             จำนวนรวม=("qty_num", "sum"),
                             เวลา=("requesttime", "max"),
                             สถานะ=("status", agg_status))
-                      )
-                grp = grp.sort_values("เวลา", ascending=False).head(num_orders)
-                # icon by status
-                def status_icon(s): 
+                      ).sort_values("เวลา", ascending=False).head(num_orders)
+                # icons
+                def status_icon(s):
                     ss = str(s).strip().lower()
                     return "🟡" if ss=="pending" else ("🟢" if ss=="approved" else "🔴")
                 grp["ไอคอน"] = grp["สถานะ"].map(status_icon)
-                # order column names and render
                 show_df = grp.rename(columns={"requestid":"เลขที่ออเดอร์"})[["ไอคอน","เลขที่ออเดอร์","รายการ","จำนวนรวม","สถานะ","เวลา"]].copy()
                 show_df["จำนวนรวม"] = show_df["จำนวนรวม"].astype(int)
-                # Use AgGrid if available for row selection
-                try:
-                    from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode  # type: ignore
-                    gb = GridOptionsBuilder.from_dataframe(show_df)
-                    gb.configure_selection("single")
-                    gb.configure_grid_options(domLayout='autoHeight')
-                    grid = AgGrid(show_df, gridOptions=gb.build(), update_mode=GridUpdateMode.SELECTION_CHANGED, fit_columns_on_grid_load=True)
-                    sel = grid.get("selected_rows", [])
-                except Exception:
-                    sel = []
-                    st.dataframe(show_df, use_container_width=True, hide_index=True)
-                # Cancel button (only Pending)
-                if sel:
-                    sel_row = dict(sel[0])
-                    if str(sel_row.get("สถานะ","")).strip().lower() == "pending":
-                        if st.button(f"ยกเลิกออเดอร์: {sel_row.get('เลขที่ออเดอร์')}", type="secondary", use_container_width=True):
-                            # set status to Canceled on all matching rows for this user and RequestID
-                            header = vals[0]
-                            # find indexes
-                            idx_id = header.index("RequestID") if "RequestID" in header else None
-                            idx_user = header.index("Username") if "Username" in header else None
-                            # status column (case-insensitive search)
-                            idx_status = None
+                st.dataframe(show_df, use_container_width=True, hide_index=True)
+                # Cancel select for Pending orders
+                pending_ids = show_df[show_df["สถานะ"]=="Pending"]["เลขที่ออเดอร์"].tolist()
+                if pending_ids:
+                    sel_id = st.selectbox("เลือกเลขที่ออเดอร์ (Pending) เพื่อยกเลิก", pending_ids, key="cancel_reqid")
+                    if st.button("ยกเลิกออเดอร์นี้", type="secondary"):
+                        header = vals[0]
+                        # indexes
+                        def idx_of(colname):
                             for i,h in enumerate(header):
-                                if str(h).strip().lower() == "status":
-                                    idx_status = i; break
-                            idx_note = None
-                            for i,h in enumerate(header):
-                                if str(h).strip().lower() == "note":
-                                    idx_note = i; break
-                            target_id = str(sel_row.get("เลขที่ออเดอร์"))
-                            changes = []
-                            for rnum in range(2, len(vals)+1):
-                                row = vals[rnum-1]
-                                rid = row[idx_id] if idx_id is not None and idx_id < len(row) else ""
-                                uname = row[idx_user] if idx_user is not None and idx_user < len(row) else ""
-                                stv = row[idx_status] if idx_status is not None and idx_status < len(row) else ""
-                                if str(rid)==target_id and str(uname).lower()==me and str(stv).strip().lower()=="pending":
-                                    if idx_status is not None:
-                                        changes.append({"range": f"{chr(ord('A')+idx_status)}{rnum}", "values": [["Canceled"]]})
-                                    if idx_note is not None:
-                                        changes.append({"range": f"{chr(ord('A')+idx_note)}{rnum}", "values": [[f"Canceled by user at {time.strftime('%Y-%m-%d %H:%M:%S')}"]]})
-                            if changes:
-                                ws.batch_update(changes)
-                                st.success(f"ยกเลิกออเดอร์ {target_id} สำเร็จ")
-                                _safe_rerun()
-                            else:
-                                st.info("ออเดอร์นี้ไม่อยู่ในสถานะ Pending แล้ว")
+                                if str(h).strip().lower()==colname.lower(): return i
+                            return None
+                        idx_id = idx_of("RequestID")
+                        idx_user = idx_of("Username")
+                        idx_status = idx_of("Status")
+                        idx_note = idx_of("Note")
+                        changes = []
+                        for rnum in range(2, len(vals)+1):
+                            row = vals[rnum-1]
+                            rid = row[idx_id] if idx_id is not None and idx_id < len(row) else ""
+                            uname = row[idx_user] if idx_user is not None and idx_user < len(row) else ""
+                            stv = row[idx_status] if idx_status is not None and idx_status < len(row) else ""
+                            if str(rid)==str(sel_id) and str(uname).lower()==me and str(stv).strip().lower()=="pending":
+                                if idx_status is not None:
+                                    changes.append({"range": f"{chr(ord('A')+idx_status)}{rnum}", "values": [["Canceled"]]})
+                                if idx_note is not None:
+                                    from time import strftime
+                                    now = strftime("%Y-%m-%d %H:%M:%S")
+                                    changes.append({"range": f"{chr(ord('A')+idx_note)}{rnum}", "values": [[f"Canceled by user at {now}"]]})
+                        if changes:
+                            ws.batch_update(changes)
+                            st.success(f"ยกเลิกออเดอร์ {sel_id} สำเร็จ")
+                            _safe_rerun()
+                        else:
+                            st.info("ออเดอร์นี้ไม่อยู่ในสถานะ Pending แล้ว")
                 else:
-                    st.caption("เลือกออเดอร์แถวหนึ่งเพื่อยกเลิก (ได้เฉพาะสถานะ Pending)")
+                    st.caption("ไม่มีออเดอร์สถานะ Pending")
             else:
                 st.dataframe(pd.DataFrame(columns=["ไอคอน","เลขที่ออเดอร์","รายการ","จำนวนรวม","สถานะ","เวลา"]), use_container_width=True, hide_index=True)
         else:
@@ -627,9 +614,7 @@ def main():
             st.success("ออกจากระบบแล้ว"); _safe_rerun()
         else:
             # Quick actions
-            if st.sidebar.button("ล้างที่เลือกทั้งหมด", use_container_width=True):
-                st.session_state["sel_map"].clear(); st.session_state["qty_map"].clear(); _safe_rerun()
-            page_issue()
+                        page_issue()
     else:
         menu = st.sidebar.radio("เมนู", options=["เข้าสู่ระบบ","Health Check"], index=0)
         if menu == "Health Check": page_health()
