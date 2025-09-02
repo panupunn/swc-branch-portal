@@ -362,95 +362,80 @@ def page_issue():
     # Summary
     chosen = edited[(edited["เลือก"] == True) & (edited["จำนวนที่เบิก"] > 0)].copy()
     if not chosen.empty:
+
         st.subheader("สรุปรายการที่จะเบิก")
 
         sum_df = chosen[["รหัส","รายการ","จำนวนที่เบิก","หน่วย"]].copy()
-        sum_df["จำนวนที่เบิก"] = sum_df["จำนวนที่เบิก"].astype(int)
+        sum_df["จำนวนที่เบิก"] = pd.to_numeric(sum_df["จำนวนที่เบิก"], errors="coerce").fillna(0).astype(int)
 
+        used_aggrid = False
         if HAS_AGGRID:
-            # Build AgGrid with +/- cell renderer
-            gb = GridOptionsBuilder.from_dataframe(sum_df, editable=True)
-            js_plus_minus = JsCode("""
-            class QtyRenderer {
-              init(params){
-                this.params = params;
-                this.eGui = document.createElement('div');
-                const val = Number(params.value || 0);
-                this.eGui.style.display = 'flex';
-                this.eGui.style.alignItems = 'center';
-                this.eGui.style.justifyContent = 'flex-end';
-                this.eGui.style.gap = '6px';
-                const btnMinus = document.createElement('button');
-                btnMinus.innerText = '−';
-                btnMinus.style.padding = '2px 8px';
-                btnMinus.style.border = '1px solid #ccc';
-                btnMinus.style.borderRadius = '6px';
-                btnMinus.addEventListener('click', ()=>{
-                  const cur = Number(this.params.value || 0);
-                  const next = Math.max(0, cur - 1);
-                  this.params.setValue(next);
-                });
-                const span = document.createElement('span');
-                span.innerText = val.toString();
-                span.style.minWidth = '20px';
-                span.style.textAlign = 'center';
-                const btnPlus = document.createElement('button');
-                btnPlus.innerText = '+';
-                btnPlus.style.padding = '2px 8px';
-                btnPlus.style.border = '1px solid #ccc';
-                btnPlus.style.borderRadius = '6px';
-                btnPlus.addEventListener('click', ()=>{
-                  const cur = Number(this.params.value || 0);
-                  const next = cur + 1;
-                  this.params.setValue(next);
-                });
-                this.eGui.appendChild(btnMinus);
-                this.eGui.appendChild(span);
-                this.eGui.appendChild(btnPlus);
-                this.span = span;
-              }
-              getGui(){ return this.eGui; }
-              refresh(params){
-                this.span.innerText = String(params.value || 0);
-                return true;
-              }
-            }
-            """)
-            gb.configure_column("รหัส", editable=False, width=120)
-            gb.configure_column("รายการ", editable=False)
-            gb.configure_column("หน่วย", editable=False, width=100)
-            gb.configure_column("จำนวนที่เบิก", editable=True, width=160,
-                                cellRenderer=js_plus_minus, valueParser=JsCode("function(x){return Number(x.newValue)||0;}"))
-            gb.configure_grid_options(domLayout='autoHeight', suppressClickEdit=False)
             try:
-                grid = AgGrid(
-                    sum_df,
-                    gridOptions=gb.build(),
-                    update_mode=GridUpdateMode.VALUE_CHANGED,
-                    allow_unsafe_jscode=True,
-                    fit_columns_on_grid_load=True,
-                )
+                from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode  # type: ignore
+                gb = GridOptionsBuilder.from_dataframe(sum_df, editable=True)
+                js_plus_minus = JsCode("""
+                class QtyRenderer {
+                  init(params){
+                    this.params = params;
+                    this.eGui = document.createElement('div');
+                    const val = Number(params.value || 0);
+                    this.eGui.style.display = 'flex';
+                    this.eGui.style.alignItems = 'center';
+                    this.eGui.style.justifyContent = 'flex-end';
+                    this.eGui.style.gap = '6px';
+                    const btnMinus = document.createElement('button');
+                    btnMinus.innerText = '−';
+                    btnMinus.style.padding = '2px 8px';
+                    btnMinus.style.border = '1px solid #ccc';
+                    btnMinus.style.borderRadius = '6px';
+                    btnMinus.addEventListener('click', ()=>{
+                      const cur = Number(this.params.value || 0);
+                      const next = Math.max(0, cur - 1);
+                      this.params.setValue(next);
+                    });
+                    const span = document.createElement('span');
+                    span.innerText = val.toString();
+                    span.style.minWidth = '20px';
+                    span.style.textAlign = 'center';
+                    const btnPlus = document.createElement('button');
+                    btnPlus.innerText = '+';
+                    btnPlus.style.padding = '2px 8px';
+                    btnPlus.style.border = '1px solid #ccc';
+                    btnPlus.style.borderRadius = '6px';
+                    btnPlus.addEventListener('click', ()=>{
+                      const cur = Number(this.params.value || 0);
+                      const next = cur + 1;
+                      this.params.setValue(next);
+                    });
+                    this.eGui.appendChild(btnMinus);
+                    this.eGui.appendChild(span);
+                    this.eGui.appendChild(btnPlus);
+                    this.span = span;
+                  }
+                  getGui(){ return this.eGui; }
+                  refresh(params){
+                    this.span.innerText = String(params.value || 0);
+                    return true;
+                  }
+                }
+                """)
+                gb.configure_column("รหัส", editable=False, width=120)
+                gb.configure_column("รายการ", editable=False)
+                gb.configure_column("หน่วย", editable=False, width=100)
+                gb.configure_column("จำนวนที่เบิก", editable=True, width=160,
+                                    cellRenderer=js_plus_minus, valueParser=JsCode("function(x){return Number(x.newValue)||0;}"))
+                gb.configure_grid_options(domLayout='autoHeight', suppressClickEdit=False)
+                grid = AgGrid(sum_df, gridOptions=gb.build(), update_mode=GridUpdateMode.VALUE_CHANGED,
+                              allow_unsafe_jscode=True, fit_columns_on_grid_load=True)
                 updated = pd.DataFrame(grid.get("data", sum_df))
+                for _, r in updated.iterrows():
+                    st.session_state["qty_map"][str(r["รหัส"])] = int(r["จำนวนที่เบิก"] or 0)
+                used_aggrid = True
             except Exception:
-                # Fallback to plain editor when AgGrid has runtime issues
-                tmp = st.data_editor(
-                    sum_df, hide_index=True, use_container_width=True,
-                    column_config={
-                        "รหัส": st.column_config.TextColumn("รหัส", disabled=True),
-                        "รายการ": st.column_config.TextColumn("รายการ", disabled=True),
-                        "จำนวนที่เบิก": st.column_config.NumberColumn("จำนวนที่เบิก", min_value=0, step=1, format="%d"),
-                        "หน่วย": st.column_config.TextColumn("หน่วย", disabled=True),
-                    },
-                    key="summary_editor_fallback",
-                )
-                updated = tmp
-            # persist back to session qty_map
-            for _, r in updated.iterrows():
-                st.session_state["qty_map"][str(r["รหัส"])] = int(r["จำนวนที่เบิก"] or 0)
-            st.dataframe(pd.DataFrame(), height=1)  # slight spacer
-        else:
-            st.warning("ต้องติดตั้งแพ็คเกจ streamlit-aggrid เพื่อใช้ปุ่ม − / + ในเซลล์ (จะใช้ตัวแก้ตัวเลขธรรมดาชั่วคราว)")
-            sum_df = st.data_editor(
+                used_aggrid = False
+        if not used_aggrid:
+            # fallback to Streamlit editor with numeric spinner
+            sum_df2 = st.data_editor(
                 sum_df, hide_index=True, use_container_width=True,
                 column_config={
                     "รหัส": st.column_config.TextColumn("รหัส", disabled=True),
@@ -458,10 +443,11 @@ def page_issue():
                     "จำนวนที่เบิก": st.column_config.NumberColumn("จำนวนที่เบิก", min_value=0, step=1, format="%d"),
                     "หน่วย": st.column_config.TextColumn("หน่วย", disabled=True),
                 },
-                key="summary_editor",
+                key="summary_editor_fallback2",
             )
-            for _, r in sum_df.iterrows():
+            for _, r in sum_df2.iterrows():
                 st.session_state["qty_map"][str(r["รหัส"])] = int(r["จำนวนที่เบิก"] or 0)
+
     else:
         st.info("ยังไม่เลือกรายการ")
 
