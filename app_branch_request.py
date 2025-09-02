@@ -273,11 +273,14 @@ def main():
             # normalize present columns
             for c in filter(None, (cu, cp, cph, cb)):
                 dfu[c] = dfu[c].astype(str).str.strip()
-row = dfu[dfu[cu].str.casefold() == (u or "").strip().casefold()].head(1)
+
+            # ค้นหาแถวผู้ใช้จากชื่อผู้ใช้ (ไม่สนตัวพิมพ์เล็ก/ใหญ่)
+            row = dfu[dfu[cu].str.casefold() == (u or "").strip().casefold()].head(1)
             if row.empty:
                 st.sidebar.error("ไม่พบผู้ใช้หรือรหัสผ่านไม่ถูกต้อง")
             else:
                 ok = False
+                # 1) ถ้ามีคอลัมน์รหัสผ่านแบบแฮช และติดตั้ง bcrypt ให้ตรวจสอบแบบแฮชก่อน
                 try:
                     if cph and str(row.iloc[0][cph]).strip():
                         if bcrypt:
@@ -287,19 +290,23 @@ row = dfu[dfu[cu].str.casefold() == (u or "").strip().casefold()].head(1)
                                 ok = False
                 except Exception:
                     ok = False
+
+                # 2) ถ้ายังไม่ผ่าน และมีคอลัมน์รหัสผ่านแบบข้อความ ให้เทียบตรง ๆ
                 if not ok and cp:
                     if str(row.iloc[0][cp]).strip() == (p or "").strip():
                         ok = True
+
                 if not ok:
                     st.sidebar.error("ไม่พบผู้ใช้หรือรหัสผ่านไม่ถูกต้อง")
                 else:
-                st.session_state["auth"] = True
-                st.session_state["user"] = {
-                    "username": (u or "").strip(),
-                    "branch": str(row.iloc[0][cb]).strip(),
-                }
-                st.sidebar.success(f"ยินดีต้อนรับ {st.session_state['user']['username']}")
-                time.sleep(0.5); do_rerun()
+                    # ตั้งค่า session เมื่อเข้าสู่ระบบสำเร็จ
+                    st.session_state["auth"] = True
+                    st.session_state["user"] = {
+                        "username": (u or "").strip(),
+                        "branch": str(row.iloc[0][cb]).strip(),
+                    }
+                    st.sidebar.success(f"ยินดีต้อนรับ {st.session_state['user']['username']}")
+                    time.sleep(0.5); do_rerun()
         st.stop()
 
     if st.sidebar.button("ออกจากระบบ"):
