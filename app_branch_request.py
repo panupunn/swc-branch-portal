@@ -460,7 +460,9 @@ def page_issue():
                 name = str(full_items[full_items["itemcode"].astype(str)==code].head(1).get("itemname", pd.Series([""])).iloc[0])
                 insufficient.append((code, name, have, qty))
         if insufficient:
-            st.error("สต็อกไม่พอ: " + ", ".join([f\"{c} ({have} < {need})\" for c,_,have,need in insufficient])); return
+            msg = "สต็อกไม่พอ: " + ", ".join([f"{c} ({have} < {need})" for c, _, have, need in insufficient])
+        st.error(msg)
+        return
 
         order_id = _generate_order_id_from_requests(ss, user.get("username",""))
         now = time.strftime("%Y-%m-%d %H:%M:%S")
