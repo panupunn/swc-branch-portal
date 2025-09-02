@@ -2,9 +2,21 @@
 # -*- coding: utf-8 -*-
 """
 WishCo Branch Portal — เบิกอุปกรณ์
-Table UI with checkbox select + auto qty=1 when ticked.
+Table UI + Requests sheet integration + persistent OrderID
 
-Version: v2025-09-02e
+Version: v2025-09-02f
+
+Changes from v4:
+- After confirm, write rows to a new sheet **Requests** so that the main app ("คำขอเบิก (จากสาขา)") can see them.
+- OrderID format: USERNAME+YYMMDD-XX (daily running per user). Running number derived from **Requests** (not Transactions).
+- Show success message with OrderID **without immediate rerun**, so it doesn't disappear.
+- Add "ประวัติคำขอ (20 ออเดอร์ล่าสุด)" table sourced from **Requests** grouped by RequestID.
+- Keep Transactions writing optional for internal history; enabled by default.
+- By default, DO NOT deduct stock when submitting requests (set `DEDUCT_STOCK_ON_REQUEST=False`).
+
+Other existing features:
+- Login fixes; flexible Users headers; bcrypt-first verify; compact Health Check.
+- Table UI with checkbox + auto qty=1 on first tick.
 """
 from __future__ import annotations
 import os, json, time
@@ -24,12 +36,18 @@ except Exception:
     bcrypt = None
 
 
-# ----------------------------- Helpers -----------------------------
+# ----------------------------- Settings -------------------------------------
+DEDUCT_STOCK_ON_REQUEST = False   # change to True if you want to decrease stock immediately
+WRITE_TRANSACTIONS     = True     # keep Transactions history as well
+
+
+# ----------------------------- Helpers --------------------------------------
 def _ensure_session_defaults():
     if "auth" not in st.session_state: st.session_state["auth"] = False
     if "user" not in st.session_state: st.session_state["user"] = {}
     if "sel_map" not in st.session_state: st.session_state["sel_map"] = {}  # {code: bool}
     if "qty_map" not in st.session_state: st.session_state["qty_map"] = {}  # {code: int}
+    if "last_order_id" not in st.session_state: st.session_state["last_order_id"] = ""
 
 
 def _safe_rerun():
@@ -95,6 +113,11 @@ CANON = {
     "itemname": ["itemname","name","สินค้า","ชื่อสินค้า","ชื่ออุปกรณ์","รายการ"],
     "stock": ["stock","คงเหลือ","จำนวนคงคลัง"],
     "unit": ["unit","หน่วย","หน่วยนับ"],
+
+    "requestid": ["requestid","reqid","orderid","เลขที่ออเดอร์"],
+    "txid": ["txid","orderid"],
+    "txtime": ["txtime","time","datetime","timestamp"],
+    "qty": ["qty","จำนวน"],
 }
 def _normalize(df: pd.DataFrame) -> pd.DataFrame:
     mapping = {}
@@ -105,6 +128,7 @@ def _normalize(df: pd.DataFrame) -> pd.DataFrame:
     return df.rename(columns=mapping).copy()
 
 
+# Sheets readers/writers
 def _read_users_df(ss) -> pd.DataFrame:
     try: ws = ss.worksheet("Users")
     except Exception:
@@ -137,6 +161,18 @@ def _read_items_df(ss) -> pd.DataFrame:
     return df
 
 
+REQ_HEADER = ["RequestTime","RequestID","Username","BranchCode","ItemCode","ItemName","Qty","Status","Note"]
+def _ensure_req_sheet(ss):
+    try:
+        ws = ss.worksheet("Requests")
+        got = ws.get_all_values()
+        if not got: ws.update("A1:I1", [REQ_HEADER])
+    except Exception:
+        ws = ss.add_worksheet(title="Requests", rows=1000, cols=15)
+        ws.update("A1:I1", [REQ_HEADER])
+    return ss.worksheet("Requests")
+
+
 TX_HEADER = ["TxTime","TxID","Username","BranchCode","ItemCode","ItemName","Qty","Type","Note"]
 def _ensure_tx_sheet(ss):
     try:
@@ -149,11 +185,17 @@ def _ensure_tx_sheet(ss):
     return ss.worksheet("Transactions")
 
 
+def _append_req(ss, rows: List[List[Any]]):
+    ws = _ensure_req_sheet(ss)
+    ws.append_rows(rows, value_input_option="USER_ENTERED")
+
+
 def _append_tx(ss, rows: List[List[Any]]):
     ws = _ensure_tx_sheet(ss)
     ws.append_rows(rows, value_input_option="USER_ENTERED")
 
 
+# Business rules
 def _is_active(val)->bool:
     if val is None: return True
     s = str(val).strip().lower()
@@ -175,23 +217,23 @@ def _derive_branch_code(ss, row)->str:
     return bc or "SWC000"
 
 
-def _generate_order_id(ss, username: str) -> str:
+def _generate_order_id_from_requests(ss, username: str) -> str:
     uname = (username or "").strip().upper()
     ymd = time.strftime("%y%m%d")
     prefix = f"{uname}{ymd}-"
-    ws = _ensure_tx_sheet(ss)
+    ws = _ensure_req_sheet(ss)
     vals = ws.get_all_values()
     max_run = 0
     if vals and len(vals) > 1:
         for r in vals[1:]:
-            txid = r[1] if len(r)>1 else ""
-            if isinstance(txid, str) and txid.startswith(prefix) and len(txid) >= len(prefix)+2:
-                suf = txid[len(prefix):len(prefix)+2]
+            rid = r[1] if len(r)>1 else ""
+            if isinstance(rid, str) and rid.startswith(prefix) and len(rid) >= len(prefix)+2:
+                suf = rid[len(prefix):len(prefix)+2]
                 if suf.isdigit(): max_run = max(max_run, int(suf))
     return f"{prefix}{min(max_run+1,99):02d}"
 
 
-# ----------------------------- UI Pages -----------------------------
+# ----------------------------- UI Pages -------------------------------------
 def page_health():
     st.title("WishCo Branch Portal — เบิกอุปกรณ์")
     st.header("🩺 Health Check — การเชื่อมต่อและโครงสร้างสเปรดชีต")
@@ -265,8 +307,7 @@ def page_issue():
         s = q.strip().lower()
         items = items[ items["itemname"].astype(str).str.lower().str.contains(s) | items["itemcode"].astype(str).str.lower().str.contains(s) ]
 
-    # Build table for editor
-    # Hidden: stock (แต่ยังใช้ตรวจหลังยืนยัน)
+    # Build table for editor (hide stock)
     codes = items["itemcode"].astype(str).tolist()
     sel_defaults = [bool(st.session_state["sel_map"].get(c, False)) for c in codes]
     qty_defaults = [int(st.session_state["qty_map"].get(c, 0)) for c in codes]
@@ -301,16 +342,14 @@ def page_issue():
         qty = int(row["จำนวนที่เบิก"] or 0)
         prev_sel = st.session_state["sel_map"].get(code, False)
         if selected and (not prev_sel) and qty <= 0:
-            # set default to 1 on first tick
             edited.at[i, "จำนวนที่เบิก"] = 1
             qty = 1
             changed = True
-        # persist maps
+        # persist
         st.session_state["sel_map"][code] = selected
         st.session_state["qty_map"][code] = qty
 
     if changed:
-        # force redraw so the user sees qty=1 instantly
         _safe_rerun()
 
     # Summary
@@ -323,69 +362,103 @@ def page_issue():
 
     # Confirm
     if (not chosen.empty) and st.button("ยืนยันการเบิก", type="primary", use_container_width=True):
-        # Validate stock
+        # Validate vs stock silently
+        full_items = _read_items_df(ss)
         insufficient = []
         for _, r in chosen.iterrows():
-            code = str(r["รหัส"])
-            qty = int(r["จำนวนที่เบิก"])
-            row = _read_items_df(ss)
-            have = float(row[row["itemcode"].astype(str)==code].head(1).get("stock", pd.Series([0])).iloc[0] or 0)
+            code = str(r["รหัส"]); qty = int(r["จำนวนที่เบิก"])
+            have = float(full_items[full_items["itemcode"].astype(str)==code].head(1).get("stock", pd.Series([0])).iloc[0] or 0)
             if qty > have:
-                name = str(row[row["itemcode"].astype(str)==code].head(1).get("itemname", pd.Series([""])).iloc[0])
+                name = str(full_items[full_items["itemcode"].astype(str)==code].head(1).get("itemname", pd.Series([""])).iloc[0])
                 insufficient.append((code, name, have, qty))
         if insufficient:
             st.error("สต็อกไม่พอ: " + ", ".join([f"{c} ({have} < {need})" for c,_,have,need in insufficient])); return
 
-        order_id = _generate_order_id(ss, user.get("username",""))
+        order_id = _generate_order_id_from_requests(ss, user.get("username",""))
         now = time.strftime("%Y-%m-%d %H:%M:%S")
-        rows = []
-        full_items = _read_items_df(ss)
+
+        # Build request rows
+        req_rows = []
         for _, r in chosen.iterrows():
             code = str(r["รหัส"]); qty = int(r["จำนวนที่เบิก"])
             item_row = full_items[full_items["itemcode"].astype(str)==code].head(1).iloc[0]
-            rows.append([ now, order_id, user.get("username",""), user.get("branch_code",""),
-                          item_row.get("itemcode"), item_row.get("itemname"), qty, "OUT", "" ])
-        try:
-            _append_tx(ss, rows)
-            # Update stock batch
-            ws = ss.worksheet("Items")
-            values = ws.get_all_values()
-            header = values[0] if values else ["ItemCode","ItemName","Stock","Unit","Category","Active"]
-            code_idx = 0
-            for i,h in enumerate(header):
-                if str(h).strip().lower() in ("itemcode","code","รหัส","รหัสสินค้า","รหัสอุปกรณ์"):
-                    code_idx = i; break
-            stock_idx = None
-            for i,h in enumerate(header):
-                if str(h).strip().lower() in ("stock","คงเหลือ","จำนวนคงคลัง"):
-                    stock_idx = i; break
-            if stock_idx is None:
-                stock_idx = len(header); header.append("Stock"); ws.update_cell(1, stock_idx+1, "Stock"); values = ws.get_all_values()
+            req_rows.append([ now, order_id, user.get("username",""), user.get("branch_code",""),
+                              item_row.get("itemcode"), item_row.get("itemname"), qty, "Pending", "" ])
 
-            # Map code to rownum
-            code_to_row = {}
-            for rn in range(2, len(values)+1):
-                row_vals = values[rn-1]
-                c = str(row_vals[code_idx]).strip() if len(row_vals)>code_idx else ""
-                if c: code_to_row[c] = rn
-
-            batch = []
+        # Build transaction rows (optional)
+        tx_rows = []
+        if WRITE_TRANSACTIONS:
             for _, r in chosen.iterrows():
                 code = str(r["รหัส"]); qty = int(r["จำนวนที่เบิก"])
-                # current have from full_items
-                have = float(full_items[full_items["itemcode"].astype(str)==code].iloc[0].get("stock") or 0)
-                new_stock = have - qty
-                rn = code_to_row.get(code)
-                if rn:
-                    batch.append({"range": f"{chr(ord('A')+stock_idx)}{rn}", "values": [[new_stock]]})
-            if batch:
-                ws.batch_update([{"range": b["range"], "values": b["values"]} for b in batch])
+                item_row = full_items[full_items["itemcode"].astype(str)==code].head(1).iloc[0]
+                tx_rows.append([ now, order_id, user.get("username",""), user.get("branch_code",""),
+                                 item_row.get("itemcode"), item_row.get("itemname"), qty, "REQ", "" ])
 
-            st.success(f"บันทึกการเบิกเรียบร้อย เลขที่ออเดอร์: **{order_id}** | รายการ: {len(rows)}")
+        try:
+            _append_req(ss, req_rows)
+            if WRITE_TRANSACTIONS and tx_rows:
+                _append_tx(ss, tx_rows)
+
+            if DEDUCT_STOCK_ON_REQUEST:
+                # Update stock immediately (optional)
+                ws = ss.worksheet("Items")
+                values = ws.get_all_values()
+                header = values[0] if values else ["ItemCode","ItemName","Stock","Unit","Category","Active"]
+                code_idx = 0
+                for i,h in enumerate(header):
+                    if str(h).strip().lower() in ("itemcode","code","รหัส","รหัสสินค้า","รหัสอุปกรณ์"): code_idx = i; break
+                stock_idx = None
+                for i,h in enumerate(header):
+                    if str(h).strip().lower() in ("stock","คงเหลือ","จำนวนคงคลัง"): stock_idx = i; break
+                if stock_idx is None:
+                    stock_idx = len(header); header.append("Stock"); ws.update_cell(1, stock_idx+1, "Stock"); values = ws.get_all_values()
+                code_to_row = {}
+                for rn in range(2, len(values)+1):
+                    row_vals = values[rn-1]
+                    c = str(row_vals[code_idx]).strip() if len(row_vals)>code_idx else ""
+                    if c: code_to_row[c] = rn
+                batch = []
+                for _, r in chosen.iterrows():
+                    code = str(r["รหัส"]); qty = int(r["จำนวนที่เบิก"])
+                    have = float(full_items[full_items["itemcode"].astype(str)==code].iloc[0].get("stock") or 0)
+                    new_stock = have - qty
+                    rn = code_to_row.get(code)
+                    if rn: batch.append({"range": f"{chr(ord('A')+stock_idx)}{rn}", "values": [[new_stock]]})
+                if batch: ws.batch_update([{"range": b["range"], "values": b["values"]} for b in batch])
+
+            st.session_state["last_order_id"] = order_id
+            st.success(f"ส่งคำขอเบิกเรียบร้อย เลขที่ออเดอร์: **{order_id}** | รายการ: {len(req_rows)}")
+            st.info("คำขอถูกบันทึกลงชีต 'Requests' เรียบร้อยแล้ว (สถานะ: Pending)")
             st.session_state["sel_map"].clear(); st.session_state["qty_map"].clear()
-            _safe_rerun()
+
         except Exception as e:
-            st.error(f"ไม่สามารถบันทึกการเบิกได้: {e}")
+            st.error(f"ไม่สามารถบันทึกคำขอได้: {e}")
+
+    # Recent order history (Requests)
+    st.subheader("ประวัติคำขอ (20 ออเดอร์ล่าสุด)")
+    try:
+        ws = _ensure_req_sheet(ss)
+        vals = ws.get_all_values()
+        if vals and len(vals) > 1:
+            df_req = pd.DataFrame(vals[1:], columns=vals[0])
+            df_req = _normalize(df_req)
+            # keep only current user
+            df_req = df_req[df_req["username"].astype(str).str.lower() == str(user.get("username","")).lower()]
+            if not df_req.empty and "requestid" in df_req.columns:
+                grp = (df_req
+                       .groupby(["requestid"], as_index=False)
+                       .agg({"qty": lambda s: sum([float(x) if str(x).replace('.','',1).isdigit() else 0 for x in s]),
+                             "requesttime": "max"})
+                       .sort_values("requesttime", ascending=False)
+                       .head(20))
+                grp = grp.rename(columns={"requestid":"เลขที่ออเดอร์","qty":"จำนวนรวม","requesttime":"เวลา"})
+                st.dataframe(grp, use_container_width=True, hide_index=True)
+            else:
+                st.info("ยังไม่มีคำขอของผู้ใช้นี้")
+        else:
+            st.info("ยังไม่มีคำขอ")
+    except Exception as e:
+        st.error(f"อ่านประวัติคำขอไม่สำเร็จ: {e}")
 
 
 def main():
@@ -396,7 +469,7 @@ def main():
         if menu == "Health Check":
             page_health()
         elif menu == "ออกจากระบบ":
-            st.session_state["auth"] = False; st.session_state["user"] = {}; st.session_state["sel_map"] = {}; st.session_state["qty_map"] = {}
+            st.session_state["auth"] = False; st.session_state["user"] = {}; st.session_state["sel_map"] = {}; st.session_state["qty_map"] = {}; st.session_state["last_order_id"] = ""
             st.success("ออกจากระบบแล้ว"); _safe_rerun()
         else:
             page_issue()
