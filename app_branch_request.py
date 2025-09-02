@@ -533,37 +533,102 @@ def page_issue():
         except Exception as e:
             st.error(f"ไม่สามารถบันทึกคำขอได้: {e}")
 
-    # History with slider and safe empty view
-    st.subheader("ประวัติคำขอ")
+    # คำขอที่ถูกบันทึกลงชีต 'Requests' พร้อมไอคอนสถานะ และปุ่มยกเลิกเมื่อ Pending
+    st.subheader("คำขอที่ส่งไป (ล่าสุด)")
     num_orders = st.slider("จำนวนออเดอร์ล่าสุดที่ต้องการดู", min_value=1, max_value=50, value=5, step=1)
     try:
         ws = _ensure_req_sheet(ss)
         vals = ws.get_all_values()
         if vals and len(vals) > 1:
-            df_req = pd.DataFrame(vals[1:], columns=vals[0])
-            df_req = _normalize(df_req)
-            for col in ["username","requestid","qty","requesttime"]:
-                if col not in df_req.columns:
-                    df_req[col] = "" if col != "qty" else 0
+            df_req_raw = pd.DataFrame(vals[1:], columns=vals[0])
+            df_req = _normalize(df_req_raw)
+            # coerce qty
+            if "qty" in df_req.columns:
+                df_req["qty_num"] = pd.to_numeric(df_req["qty"], errors="coerce").fillna(0).astype(float)
+            else:
+                df_req["qty_num"] = 0.0
             me = str(user.get("username","")).lower()
-            df_req = df_req[df_req["username"].astype(str).str.lower() == me]
-            if not df_req.empty and "requestid" in df_req.columns:
-                df_req["qty_num"] = pd.to_numeric(df_req["qty"], errors="coerce").fillna(0.0)
+            df_req = df_req[df_req.get("username","").astype(str).str.lower() == me]
+            # Build 'รายการ' เป็นชื่อ + (qty) คั่นด้วย comma
+            if not df_req.empty:
+                df_req["pair"] = df_req.get("itemname","").astype(str) + " (" + df_req["qty_num"].astype(int).astype(str) + ")"
+                def agg_status(g):
+                    statuses = set(str(x).strip().lower() for x in g.get("status","").astype(str))
+                    if "canceled" in statuses or "cancelled" in statuses: return "Canceled"
+                    if "approved" in statuses or "อนุมัติ" in statuses: return "Approved"
+                    return "Pending"
                 grp = (df_req
                        .groupby(["requestid"], as_index=False)
-                       .agg({"qty_num":"sum","requesttime":"max"})
-                       .sort_values("requesttime", ascending=False)
-                       .head(num_orders))
-                grp = grp.rename(columns={"requestid":"เลขที่ออเดอร์","qty_num":"จำนวนรวม","requesttime":"เวลา"})
-                st.dataframe(grp, use_container_width=True, hide_index=True)
+                       .agg(รายการ=("pair", lambda s: ", ".join(list(s))),
+                            จำนวนรวม=("qty_num", "sum"),
+                            เวลา=("requesttime", "max"),
+                            สถานะ=("status", agg_status))
+                      )
+                grp = grp.sort_values("เวลา", ascending=False).head(num_orders)
+                # icon by status
+                def status_icon(s): 
+                    ss = str(s).strip().lower()
+                    return "🟡" if ss=="pending" else ("🟢" if ss=="approved" else "🔴")
+                grp["ไอคอน"] = grp["สถานะ"].map(status_icon)
+                # order column names and render
+                show_df = grp.rename(columns={"requestid":"เลขที่ออเดอร์"})[["ไอคอน","เลขที่ออเดอร์","รายการ","จำนวนรวม","สถานะ","เวลา"]].copy()
+                show_df["จำนวนรวม"] = show_df["จำนวนรวม"].astype(int)
+                # Use AgGrid if available for row selection
+                try:
+                    from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode  # type: ignore
+                    gb = GridOptionsBuilder.from_dataframe(show_df)
+                    gb.configure_selection("single")
+                    gb.configure_grid_options(domLayout='autoHeight')
+                    grid = AgGrid(show_df, gridOptions=gb.build(), update_mode=GridUpdateMode.SELECTION_CHANGED, fit_columns_on_grid_load=True)
+                    sel = grid.get("selected_rows", [])
+                except Exception:
+                    sel = []
+                    st.dataframe(show_df, use_container_width=True, hide_index=True)
+                # Cancel button (only Pending)
+                if sel:
+                    sel_row = dict(sel[0])
+                    if str(sel_row.get("สถานะ","")).strip().lower() == "pending":
+                        if st.button(f"ยกเลิกออเดอร์: {sel_row.get('เลขที่ออเดอร์')}", type="secondary", use_container_width=True):
+                            # set status to Canceled on all matching rows for this user and RequestID
+                            header = vals[0]
+                            # find indexes
+                            idx_id = header.index("RequestID") if "RequestID" in header else None
+                            idx_user = header.index("Username") if "Username" in header else None
+                            # status column (case-insensitive search)
+                            idx_status = None
+                            for i,h in enumerate(header):
+                                if str(h).strip().lower() == "status":
+                                    idx_status = i; break
+                            idx_note = None
+                            for i,h in enumerate(header):
+                                if str(h).strip().lower() == "note":
+                                    idx_note = i; break
+                            target_id = str(sel_row.get("เลขที่ออเดอร์"))
+                            changes = []
+                            for rnum in range(2, len(vals)+1):
+                                row = vals[rnum-1]
+                                rid = row[idx_id] if idx_id is not None and idx_id < len(row) else ""
+                                uname = row[idx_user] if idx_user is not None and idx_user < len(row) else ""
+                                stv = row[idx_status] if idx_status is not None and idx_status < len(row) else ""
+                                if str(rid)==target_id and str(uname).lower()==me and str(stv).strip().lower()=="pending":
+                                    if idx_status is not None:
+                                        changes.append({"range": f"{chr(ord('A')+idx_status)}{rnum}", "values": [["Canceled"]]})
+                                    if idx_note is not None:
+                                        changes.append({"range": f"{chr(ord('A')+idx_note)}{rnum}", "values": [[f"Canceled by user at {time.strftime('%Y-%m-%d %H:%M:%S')}"]]})
+                            if changes:
+                                ws.batch_update(changes)
+                                st.success(f"ยกเลิกออเดอร์ {target_id} สำเร็จ")
+                                _safe_rerun()
+                            else:
+                                st.info("ออเดอร์นี้ไม่อยู่ในสถานะ Pending แล้ว")
+                else:
+                    st.caption("เลือกออเดอร์แถวหนึ่งเพื่อยกเลิก (ได้เฉพาะสถานะ Pending)")
             else:
-                st.dataframe(pd.DataFrame(columns=["เลขที่ออเดอร์","จำนวนรวม","เวลา"]), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(columns=["ไอคอน","เลขที่ออเดอร์","รายการ","จำนวนรวม","สถานะ","เวลา"]), use_container_width=True, hide_index=True)
         else:
-            st.dataframe(pd.DataFrame(columns=["เลขที่ออเดอร์","จำนวนรวม","เวลา"]), use_container_width=True, hide_index=True)
-    except Exception:
-        st.dataframe(pd.DataFrame(columns=["เลขที่ออเดอร์","จำนวนรวม","เวลา"]), use_container_width=True, hide_index=True)
-
-
+            st.dataframe(pd.DataFrame(columns=["ไอคอน","เลขที่ออเดอร์","รายการ","จำนวนรวม","สถานะ","เวลา"]), use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.dataframe(pd.DataFrame(columns=["ไอคอน","เลขที่ออเดอร์","รายการ","จำนวนรวม","สถานะ","เวลา"]), use_container_width=True, hide_index=True)
 def main():
     st.set_page_config(page_title="WishCo Branch Portal", layout="wide", page_icon="🧰")
     _ensure_session_defaults()
