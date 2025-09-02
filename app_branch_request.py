@@ -353,114 +353,155 @@ def _items_editor(ss):
     return edited, items
 
 
-def _requests_table(ss, user):
-    """Render latest requests with icons + cancel pending by dropdown."""
-    st.subheader("คำขอที่ส่งไป (ล่าสุด)")
-    num = st.slider("จำนวนออเดอร์ล่าสุดที่ต้องการดู", 1, 50, 5, 1)
 
-    try:
-        ws = _requests_ws(ss)
-        vals = ws.get_all_values()
-        if not vals or len(vals) <= 1:
-            st.dataframe(pd.DataFrame(columns=["ไอคอน","เลขที่ออเดอร์","รายการ","จำนวนรวม","สถานะ","เวลา"]), 
-                         use_container_width=True, hide_index=True)
-            return
+def _requests_and_history_tabs(ss, user):
+    """Render two tabs:
+       1) คำขอที่ส่ง (ล่าสุด) — Requests with icons + cancel pending
+       2) ประวัติการเบิก — From Transactions sheet (last N), grouped by TxID
+    """
+    t1, t2 = st.tabs(["คำขอที่ส่ง (ล่าสุด)", "ประวัติการเบิก"])
 
-        df = pd.DataFrame(vals[1:], columns=vals[0])
-        df = _normalize(df)
+    # ---------- Tab 1: Recent Requests ----------
+    with t1:
+        st.subheader("คำขอที่ส่ง (ล่าสุด)")
+        num = st.slider("จำนวนออเดอร์ล่าสุดที่ต้องการดู", 1, 50, 5, 1, key="slider_recent_reqs")
 
-        # columns (robust fallback)
-        def pick(df, *cands):
-            for c in cands:
-                if c in df.columns: return c
-            lowers = {c.lower(): c for c in df.columns}
-            for c in cands:
-                if c.lower() in lowers: return lowers[c.lower()]
-            return None
+        try:
+            ws = _requests_ws(ss)
+            vals = ws.get_all_values()
+            if not vals or len(vals) <= 1:
+                st.dataframe(pd.DataFrame(columns=["ไอคอน","เลขที่ออเดอร์","รายการ","จำนวนรวม","สถานะ","เวลา"]),
+                             use_container_width=True, hide_index=True)
+            else:
+                df = pd.DataFrame(vals[1:], columns=vals[0])
+                df = _normalize(df)
 
-        c_user = pick(df, "username","Username")
-        c_id   = pick(df, "requestid","RequestID","orderid")
-        c_qty  = pick(df, "qty","Qty","จำนวน")
-        c_name = pick(df, "itemname","ItemName","รายการ")
-        c_stat = pick(df, "status","Status","สถานะ")
-        c_time = pick(df, "requesttime","RequestTime","time","datetime")
+                def pick(df, *cands):
+                    for c in cands:
+                        if c in df.columns: return c
+                    lowers = {c.lower(): c for c in df.columns}
+                    for c in cands:
+                        if c.lower() in lowers: return lowers[c.lower()]
+                    return None
 
-        me = str(user.get("username","")).lower()
-        if c_user:
-            df = df[df[c_user].astype(str).str.lower() == me]
+                c_user = pick(df, "username","Username")
+                c_id   = pick(df, "requestid","RequestID","orderid")
+                c_qty  = pick(df, "qty","Qty","จำนวน")
+                c_name = pick(df, "itemname","ItemName","รายการ")
+                c_stat = pick(df, "status","Status","สถานะ")
+                c_time = pick(df, "requesttime","RequestTime","time","datetime")
 
-        if c_qty: df["qty_num"] = pd.to_numeric(df[c_qty], errors="coerce").fillna(0).astype(float)
-        else:     df["qty_num"] = 0.0
-        if not c_name: c_name = c_id
+                me = str(user.get("username","")).strip().lower()
+                if c_user:
+                    df = df[df[c_user].astype(str).str.strip().str.lower() == me]
 
-        if not c_stat:
-            df["__status__"] = "Pending"; c_stat="__status__"
-        if not c_time:
-            df["__time__"] = ""; c_time="__time__"
+                if c_qty: df["qty_num"] = pd.to_numeric(df[c_qty], errors="coerce").fillna(0).astype(float)
+                else:     df["qty_num"] = 0.0
+                if not c_name: c_name = c_id
 
-        if not c_id or df.empty:
-            st.dataframe(pd.DataFrame(columns=["ไอคอน","เลขที่ออเดอร์","รายการ","จำนวนรวม","สถานะ","เวลา"]), 
-                         use_container_width=True, hide_index=True)
-            return
+                if not c_stat:
+                    df["__status__"] = "Pending"; c_stat="__status__"
+                if not c_time:
+                    df["__time__"] = ""; c_time="__time__"
 
-        df["pair"] = df[c_name].astype(str) + " (" + df["qty_num"].astype(int).astype(str) + ")"
-        def agg_status(g):
-            sset = set(str(x).strip().lower() for x in g[c_stat].astype(str))
-            if "canceled" in sset or "cancelled" in sset: return "Canceled"
-            if "approved" in sset or "อนุมัติ" in sset: return "Approved"
-            return "Pending"
-
-        grp = (df.groupby([c_id], as_index=False)
-                 .agg(รายการ=("pair", lambda s: ", ".join(list(s))),
-                      จำนวนรวม=("qty_num","sum"),
-                      เวลา=(c_time,"max"),
-                      สถานะ=(c_stat, agg_status))
-               ).sort_values("เวลา", ascending=False).head(num)
-
-        def icon(s):
-            ss = str(s).strip().lower()
-            return "🟡" if ss=="pending" else ("🟢" if ss=="approved" else "🔴")
-        grp["ไอคอน"] = grp["สถานะ"].map(icon)
-
-        show = grp.rename(columns={c_id:"เลขที่ออเดอร์"})[["ไอคอน","เลขที่ออเดอร์","รายการ","จำนวนรวม","สถานะ","เวลา"]].copy()
-        show["จำนวนรวม"] = show["จำนวนรวม"].astype(int)
-        st.dataframe(show, use_container_width=True, hide_index=True)
-
-        # cancel pending
-        pending_ids = show[show["สถานะ"]=="Pending"]["เลขที่ออเดอร์"].tolist()
-        if pending_ids:
-            sel = st.selectbox("เลือกเลขที่ออเดอร์ (Pending) เพื่อยกเลิก", pending_ids, key="cancel_reqid")
-            if st.button("ยกเลิกออเดอร์นี้", type="secondary"):
-                header = vals[0]
-                lowers = {str(h).strip().lower(): i for i,h in enumerate(header)}
-                idx_id    = lowers.get("requestid", lowers.get("orderid"))
-                idx_user  = lowers.get("username")
-                idx_stat  = lowers.get("status")
-                idx_note  = lowers.get("note")
-                changes = []
-                now = time.strftime("%Y-%m-%d %H:%M:%S")
-                for rnum in range(2, len(vals)+1):
-                    row = vals[rnum-1]
-                    rid = row[idx_id]   if idx_id  is not None and idx_id  < len(row) else ""
-                    un  = row[idx_user] if idx_user is not None and idx_user < len(row) else ""
-                    stv = row[idx_stat] if idx_stat is not None and idx_stat < len(row) else ""
-                    if str(rid)==str(sel) and str(un).lower()==me and str(stv).strip().lower()=="pending":
-                        if idx_stat is not None:
-                            changes.append({"range": f"{chr(ord('A')+idx_stat)}{rnum}", "values": [["Canceled"]]})
-                        if idx_note is not None:
-                            changes.append({"range": f"{chr(ord('A')+idx_note)}{rnum}", "values": [[f"Canceled by user at {now}"]]})
-                if changes:
-                    ws.batch_update(changes)
-                    st.success(f"ยกเลิกออเดอร์ {sel} สำเร็จ")
-                    _safe_rerun()
+                if not c_id or df.empty:
+                    st.dataframe(pd.DataFrame(columns=["ไอคอน","เลขที่ออเดอร์","รายการ","จำนวนรวม","สถานะ","เวลา"]),
+                                 use_container_width=True, hide_index=True)
                 else:
-                    st.info("ออเดอร์นี้ไม่อยู่ในสถานะ Pending แล้ว")
-        else:
-            st.caption("ไม่มีออเดอร์สถานะ Pending")
+                    df["pair"] = df[c_name].astype(str) + " (" + df["qty_num"].astype(int).astype(str) + ")"
+                    def agg_status(g):
+                        sset = set(str(x).strip().lower() for x in g[c_stat].astype(str))
+                        if "canceled" in sset or "cancelled" in sset: return "Canceled"
+                        if "approved" in sset or "อนุมัติ" in sset: return "Approved"
+                        return "Pending"
 
-    except Exception as e:
-        st.dataframe(pd.DataFrame(columns=["ไอคอน","เลขที่ออเดอร์","รายการ","จำนวนรวม","สถานะ","เวลา"]), 
-                     use_container_width=True, hide_index=True)
+                    grp = (df.groupby([c_id], as_index=False)
+                            .agg(รายการ=("pair", lambda s: ", ".join(list(s))),
+                                 จำนวนรวม=("qty_num","sum"),
+                                 เวลา=(c_time,"max"),
+                                 สถานะ=(c_stat, agg_status))
+                          ).sort_values("เวลา", ascending=False).head(num)
+
+                    def icon(s):
+                        ss = str(s).strip().lower()
+                        return "🟡" if ss=="pending" else ("🟢" if ss=="approved" else "🔴")
+                    grp["ไอคอน"] = grp["สถานะ"].map(icon)
+
+                    show = grp.rename(columns={c_id:"เลขที่ออเดอร์"})[["ไอคอน","เลขที่ออเดอร์","รายการ","จำนวนรวม","สถานะ","เวลา"]].copy()
+                    show["จำนวนรวม"] = show["จำนวนรวม"].astype(int)
+                    st.dataframe(show, use_container_width=True, hide_index=True)
+
+                    pending_ids = show[show["สถานะ"]=="Pending"]["เลขที่ออเดอร์"].tolist()
+                    if pending_ids:
+                        sel = st.selectbox("เลือกเลขที่ออเดอร์ (Pending) เพื่อยกเลิก", pending_ids, key="cancel_reqid_v12")
+                        if st.button("ยกเลิกออเดอร์นี้", type="secondary", key="btn_cancel_req_v12"):
+                            header = vals[0]
+                            lowers = {str(h).strip().lower(): i for i,h in enumerate(header)}
+                            idx_id    = lowers.get("requestid", lowers.get("orderid"))
+                            idx_user  = lowers.get("username")
+                            idx_stat  = lowers.get("status")
+                            idx_note  = lowers.get("note")
+                            changes = []
+                            now = time.strftime("%Y-%m-%d %H:%M:%S")
+                            for rnum in range(2, len(vals)+1):
+                                row = vals[rnum-1]
+                                rid = row[idx_id]   if idx_id  is not None and idx_id  < len(row) else ""
+                                un  = row[idx_user] if idx_user is not None and idx_user < len(row) else ""
+                                stv = row[idx_stat] if idx_stat is not None and idx_stat < len(row) else ""
+                                if str(rid)==str(sel) and str(un).strip().lower()==me and str(stv).strip().lower()=="pending":
+                                    if idx_stat is not None:
+                                        changes.append({"range": f"{chr(ord('A')+idx_stat)}{rnum}", "values": [["Canceled"]]})
+                                    if idx_note is not None:
+                                        changes.append({"range": f"{chr(ord('A')+idx_note)}{rnum}", "values": [[f"Canceled by user at {now}"]]})
+                            if changes:
+                                ws.batch_update(changes)
+                                st.success(f"ยกเลิกออเดอร์ {sel} สำเร็จ")
+                                _safe_rerun()
+                            else:
+                                st.info("ออเดอร์นี้ไม่อยู่ในสถานะ Pending แล้ว")
+                    else:
+                        st.caption("ไม่มีออเดอร์สถานะ Pending")
+
+        except Exception:
+            st.dataframe(pd.DataFrame(columns=["ไอคอน","เลขที่ออเดอร์","รายการ","จำนวนรวม","สถานะ","เวลา"]),
+                         use_container_width=True, hide_index=True)
+
+    # ---------- Tab 2: History (Transactions) ----------
+    with t2:
+        st.subheader("ประวัติการเบิก")
+        num2 = st.slider("จำนวนรายการล่าสุดที่ต้องการดู", 1, 200, 50, 1, key="slider_history_tx")
+        try:
+            ws = _transactions_ws(ss)
+            vals = ws.get_all_values()
+            if not vals or len(vals) <= 1:
+                st.dataframe(pd.DataFrame(columns=["เวลา","เลขที่TX","รหัส","รายการ","จำนวน","ประเภท","หมายเหตุ"]),
+                             use_container_width=True, hide_index=True)
+            else:
+                df = pd.DataFrame(vals[1:], columns=vals[0])
+                df = _normalize(df)
+                me = str(user.get("username","")).strip().lower()
+                if "username" in df.columns:
+                    df = df[df["username"].astype(str).str.strip().str.lower() == me]
+                # coerce qty
+                if "qty" in df.columns:
+                    df["qty_num"] = pd.to_numeric(df["qty"], errors="coerce").fillna(0).astype(float)
+                else:
+                    df["qty_num"] = 0.0
+                # select view
+                cols = {}
+                cols["เวลา"]   = df.get("txtime", df.get("time", df.get("requesttime", "")))
+                cols["เลขที่TX"] = df.get("txid", df.get("requestid",""))
+                cols["รหัส"]   = df.get("itemcode","")
+                cols["รายการ"] = df.get("itemname","")
+                cols["จำนวน"]  = df["qty_num"].astype(int)
+                cols["ประเภท"] = df.get("type","")
+                cols["หมายเหตุ"] = df.get("note","")
+                out = pd.DataFrame(cols)
+                out = out.tail(num2)
+                st.dataframe(out, use_container_width=True, hide_index=True)
+        except Exception:
+            st.dataframe(pd.DataFrame(columns=["เวลา","เลขที่TX","รหัส","รายการ","จำนวน","ประเภท","หมายเหตุ"]),
+                         use_container_width=True, hide_index=True)
 
 
 def page_issue():
@@ -523,6 +564,12 @@ def page_issue():
                                   row.get("itemcode"), row.get("itemname"), q, "Pending", "" ])
             try:
                 _append_rows(_requests_ws(ss), req_rows)
+                # also append to Transactions for history
+                tx_rows = [ [now, order_id, user.get("username",""), user.get("branch_code",""), r[4], r[5], r[6], "Request", ""] for r in req_rows ]
+                try:
+                    _append_rows(_transactions_ws(ss), tx_rows)
+                except Exception:
+                    pass
                 st.session_state["last_order_id"] = order_id
                 st.success(f"ส่งคำขอเบิกเรียบร้อย เลขที่ออเดอร์: {order_id} | รายการ: {len(req_rows)}")
                 st.info("คำขอถูกบันทึกลงชีต 'Requests' เรียบร้อยแล้ว (สถานะ: Pending)")
@@ -533,7 +580,7 @@ def page_issue():
         st.info("ยังไม่เลือกรายการ")
 
     # history table with icons + cancel
-    _requests_table(ss, user)
+    _requests_and_history_tabs(ss, user)
 
 
 def main():
