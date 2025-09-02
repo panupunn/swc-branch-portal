@@ -2,20 +2,22 @@
 # -*- coding: utf-8 -*-
 """
 WishCo Branch Portal — เบิกอุปกรณ์
-Full flow: Login + Health Check + เบิกอุปกรณ์ (Items OUT)
-Version: v2025-09-02c
+Full flow with selection & +/- controls + OrderID (username+YYMMDD-XX)
 
-Key points:
-- Safe rerun across Streamlit versions (st.rerun fallback).
-- Login fixed (indentation, Users header relaxed, bcrypt-first).
-- Health Check (compact): only shows found secret keys & spreadsheet title.
-- Issue page "เบิกอุปกรณ์": browse/search Items, input quantities, commit to Transactions,
-  update stock with basic concurrency checks and helpful messages.
-- Auto-create/repair headers for Users, Items, Transactions sheets if missing.
-- Minimal UI and Thai labels, smartphone-friendly.
+Version: v2025-09-02d
+
+- Login fixes (indentation, bcrypt-first, flexible Users header)
+- Health Check (compact)
+- Issue page:
+  * Hide stock column in UI
+  * Select rows with checkbox, per-row +/- controls for quantity
+  * Summary of selected items
+  * OrderID format: <USERNAME><YYMMDD>-<XX> (01-99 per user per day, auto-run)
+  * Append to Transactions (history) and update Items stock
+  * Show recent history by order for the current user
 """
 from __future__ import annotations
-import os, json, time, uuid
+import os, json, time, re, uuid
 from typing import Dict, Any, List, Optional
 
 import streamlit as st
@@ -36,7 +38,8 @@ except Exception:
 def _ensure_session_defaults():
     if "auth" not in st.session_state: st.session_state["auth"] = False
     if "user" not in st.session_state: st.session_state["user"] = {}
-    if "cart" not in st.session_state: st.session_state["cart"] = {}  # {ItemCode: qty}
+    if "qty_map" not in st.session_state: st.session_state["qty_map"] = {}  # {ItemCode: qty}
+    if "sel_map" not in st.session_state: st.session_state["sel_map"] = {}  # {ItemCode: bool}
 
 
 def _safe_rerun():
@@ -191,13 +194,22 @@ def _read_items_df(ss) -> pd.DataFrame:
 
 
 # ----- Transactions -----
-TX_HEADER = ["TxTime","TxID","Username","BranchCode","ItemCode","ItemName","Qty","Type","Note"]
-def _append_transactions(ss, rows: List[List[Any]]):
-    try: ws = ss.worksheet("Transactions")
+# We'll keep legacy columns and use TxID as OrderID for compatibility.
+TX_LEGACY_HEADER = ["TxTime","TxID","Username","BranchCode","ItemCode","ItemName","Qty","Type","Note"]
+def _ensure_transactions_sheet(ss):
+    try:
+        ws = ss.worksheet("Transactions")
+        header = ws.get_all_values()[0] if ws.get_all_values() else []
+        if not header:
+            ws.update("A1:I1", [TX_LEGACY_HEADER])
     except Exception:
         ws = ss.add_worksheet(title="Transactions", rows=1000, cols=15)
-        ws.update("A1:I1", [TX_HEADER])
-    # Append rows
+        ws.update("A1:I1", [TX_LEGACY_HEADER])
+    return ss.worksheet("Transactions")
+
+
+def _append_transactions(ss, rows: List[List[Any]]):
+    ws = _ensure_transactions_sheet(ss)
     ws.append_rows(rows, value_input_option="USER_ENTERED")
 
 
@@ -239,6 +251,26 @@ def _derive_branch_code(ss, row: pd.Series) -> str:
     except Exception:
         pass
     return "SWC000"
+
+
+def _generate_order_id(ss, username: str) -> str:
+    """username + YYMMDD-XX (per user per day)"""
+    uname = (username or "").strip().upper()
+    ymd = time.strftime("%y%m%d")
+    prefix = f"{uname}{ymd}-"
+    ws = _ensure_transactions_sheet(ss)
+    vals = ws.get_all_values()
+    max_run = 0
+    if vals and len(vals) > 1:
+        # Find in TxID column (index 1)
+        for r in vals[1:]:
+            txid = r[1] if len(r)>1 else ""
+            if isinstance(txid, str) and txid.startswith(prefix) and len(txid) >= len(prefix)+2:
+                suf = txid[len(prefix):len(prefix)+2]
+                if suf.isdigit():
+                    max_run = max(max_run, int(suf))
+    next_run = min(max_run + 1, 99)
+    return f"{prefix}{next_run:02d}"
 
 
 # ----------------------------- UI: Health Check -----------------------------
@@ -305,24 +337,45 @@ def page_login():
         "username": str(r.get("username") or "").strip(),
         "displayname": str(r.get("displayname") or ""),
         "role": str(r.get("role") or ""),
-        "branch_code": _derive_branch_code(ss, r),
+        "branch_code": _derive_branch_code(_open_spreadsheet(), r),
     }
     st.session_state["auth"] = True
+    st.session_state["qty_map"] = {}
+    st.session_state["sel_map"] = {}
     st.success("ล็อกอินสำเร็จ — กำลังกำหนดค่าสภาพแวดล้อม...")
     _safe_rerun()
 
 
 # ----------------------------- UI: Issue Items ------------------------------
-def _render_cart_table(items_df: pd.DataFrame, cart: Dict[str, float]):
-    if not cart:
-        st.info("ยังไม่เลือกรายการเบิก")
-        return pd.DataFrame()
-    codes = list(cart.keys())
-    sub = items_df[items_df["itemcode"].astype(str).isin(codes)].copy()
-    sub["จำนวนที่เบิก"] = sub["itemcode"].map(cart).fillna(0)
-    sub = sub[["itemcode","itemname","stock","จำนวนที่เบิก","unit","category"]]
-    st.dataframe(sub, use_container_width=True, hide_index=True)
-    return sub
+def _row_controls(code: str, name: str, default_qty: float = 0.0):
+    sel_key = f"sel_{code}"
+    qty_key = f"qty_{code}"
+
+    if sel_key not in st.session_state:
+        st.session_state[sel_key] = st.session_state["sel_map"].get(code, False)
+    if qty_key not in st.session_state:
+        st.session_state[qty_key] = st.session_state["qty_map"].get(code, default_qty)
+
+    c1, c2, c3, c4, c5 = st.columns([0.08, 0.18, 0.56, 0.09, 0.09])
+    with c1:
+        sel = st.checkbox("", key=sel_key)
+    with c2:
+        st.write(f"**{code}**")
+    with c3:
+        st.write(name)
+    with c4:
+        if st.button("－", key=f"minus_{code}"):
+            st.session_state[qty_key] = max(0, int(st.session_state[qty_key]) - 1)
+    with c5:
+        if st.button("＋", key=f"plus_{code}"):
+            st.session_state[qty_key] = int(st.session_state[qty_key]) + 1
+
+    # show qty right aligned under the row (small)
+    st.caption(f"จำนวน: {int(st.session_state[qty_key])}")
+
+    # Sync maps
+    st.session_state["sel_map"][code] = st.session_state[sel_key]
+    st.session_state["qty_map"][code] = int(st.session_state[qty_key])
 
 
 def page_issue():
@@ -357,72 +410,69 @@ def page_issue():
             df_show["itemcode"].astype(str).str.lower().str.contains(s)
         ]
 
-    # Prepare editable column for quantity
-    edit_df = df_show[["itemcode","itemname","stock"]].copy()
-    edit_df["จำนวนที่เบิก"] = 0
-    edited = st.data_editor(
-        edit_df,
-        num_rows="dynamic",
-        column_config={
-            "itemcode": st.column_config.TextColumn("รหัส"),
-            "itemname": st.column_config.TextColumn("รายการ"),
-            "stock": st.column_config.NumberColumn("คงเหลือ"),
-            "จำนวนที่เบิก": st.column_config.NumberColumn("จำนวนที่เบิก", min_value=0, step=1),
-        },
-        disabled=["itemcode","itemname","stock"],
-        hide_index=True,
-        use_container_width=True,
-        key="edit_items"
-    )
+    st.markdown("##### เลือกรายการที่จะเบิก")
+    header_cols = st.columns([0.08, 0.18, 0.56, 0.09, 0.09])
+    header_cols[0].markdown("**เลือก**")
+    header_cols[1].markdown("**รหัส**")
+    header_cols[2].markdown("**รายการ**")
+    header_cols[3].markdown("**ลด**")
+    header_cols[4].markdown("**เพิ่ม**")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("เพิ่มลงตะกร้า / อัปเดตตะกร้า", use_container_width=True):
-            cart = {}
-            for _, row in edited.iterrows():
-                qty = float(row.get("จำนวนที่เบิก") or 0)
-                code = str(row.get("itemcode"))
-                if qty > 0:
-                    cart[code] = qty
-            st.session_state["cart"] = cart
-            st.success(f"อัปเดตตะกร้าแล้ว: {len(cart)} รายการ")
-    with col2:
-        if st.button("ล้างตะกร้า", use_container_width=True):
-            st.session_state["cart"] = {}
-            st.info("ล้างตะกร้าแล้ว")
+    # List rows with controls (no stock shown)
+    for _, r in df_show.iterrows():
+        code = str(r.get("itemcode"))
+        name = str(r.get("itemname"))
+        _row_controls(code, name)
 
-    # Show cart
-    st.subheader("ตะกร้า")
-    sub = _render_cart_table(df_items, st.session_state.get("cart", {}))
+    st.divider()
+
+    # Build summary from selected items
+    qty_map = st.session_state.get("qty_map", {})
+    sel_map = st.session_state.get("sel_map", {})
+    chosen = [(c, int(qty_map.get(c, 0))) for c, sel in sel_map.items() if sel and int(qty_map.get(c, 0)) > 0]
+    if chosen:
+        sub_df = df_items[df_items["itemcode"].astype(str).isin([c for c, _ in chosen])][["itemcode","itemname","unit","stock"]].copy()
+        sub_df["จำนวนที่เบิก"] = sub_df["itemcode"].map(dict(chosen)).astype(int)
+        show_df = sub_df[["itemcode","itemname","จำนวนที่เบิก","unit"]]
+        st.subheader("สรุปรายการที่จะเบิก")
+        st.dataframe(show_df.rename(columns={"itemcode":"รหัส","itemname":"รายการ","unit":"หน่วย"}),
+                     use_container_width=True, hide_index=True)
+    else:
+        st.info("ยังไม่เลือกรายการ")
 
     # Commit
-    if not sub.empty and st.button("ยืนยันการเบิก", type="primary", use_container_width=True):
-        # Validation vs stock
-        cart = st.session_state.get("cart", {})
+    if chosen and st.button("ยืนยันการเบิก", type="primary", use_container_width=True):
+        # Validate vs stock (even though we hide from UI)
         insufficient = []
-        for _, r in sub.iterrows():
-            if float(r["จำนวนที่เบิก"]) > float(r["stock"]):
-                insufficient.append((r["itemcode"], r["itemname"], r["stock"], r["จำนวนที่เบิก"]))
+        for code, qty in chosen:
+            r = df_items[df_items["itemcode"].astype(str) == str(code)].head(1)
+            if r.empty:
+                insufficient.append((code, "ไม่พบใน Items", 0, qty))
+            else:
+                have = float(r.iloc[0].get("stock") or 0)
+                if qty > have:
+                    insufficient.append((code, str(r.iloc[0].get("itemname")), have, qty))
         if insufficient:
             st.error("สต็อกไม่พอ: " + ", ".join([f"{c} ({have} < {need})" for c,_,have,need in insufficient]))
             return
 
-        # Append transactions & update stock
+        # Build rows
+        order_id = _generate_order_id(ss, user.get("username",""))
         now = time.strftime("%Y-%m-%d %H:%M:%S")
-        txid = f"OUT-{int(time.time())}-{uuid.uuid4().hex[:6].upper()}"
         rows = []
-        for _, r in sub.iterrows():
+        for code, qty in chosen:
+            r = df_items[df_items["itemcode"].astype(str) == str(code)].iloc[0]
             rows.append([
-                now, txid, user.get("username",""), user.get("branch_code",""),
-                r["itemcode"], r["itemname"], float(r["จำนวนที่เบิก"]), "OUT", ""
+                now, order_id, user.get("username",""), user.get("branch_code",""),
+                r.get("itemcode"), r.get("itemname"), int(qty), "OUT", ""
             ])
         try:
             _append_transactions(ss, rows)
-            # Update each item stock
+            # Update stock in Items
             ws = ss.worksheet("Items")
             values = ws.get_all_values()
             header = values[0] if values else ITEMS_HEADER
-            # Build index of code -> row number
+            # locate code and stock column
             code_idx = 0
             for i,h in enumerate(header):
                 if str(h).strip().lower() in ("itemcode","code","รหัส","รหัสสินค้า","รหัสอุปกรณ์"):
@@ -432,34 +482,58 @@ def page_issue():
                 if str(h).strip().lower() in ("stock","คงเหลือ","จำนวนคงคลัง"):
                     stock_idx = i; break
             if stock_idx is None:
-                # create Stock column if missing
                 stock_idx = len(header)
                 header.append("Stock")
                 ws.update_cell(1, stock_idx+1, "Stock")
                 values = ws.get_all_values()
-            # Build map
             code_to_rownum = {}
             for rn in range(2, len(values)+1):
                 row_vals = values[rn-1] if rn-1 < len(values) else []
-                code = str(row_vals[code_idx]).strip() if len(row_vals)>code_idx else ""
-                if code:
-                    code_to_rownum[code] = rn
-            # Apply updates
+                c = str(row_vals[code_idx]).strip() if len(row_vals)>code_idx else ""
+                if c:
+                    code_to_rownum[c] = rn
             batch_updates = []
-            for _, r in sub.iterrows():
-                code = str(r["itemcode"])
-                rn = code_to_rownum.get(code)
+            for code, qty in chosen:
+                rn = code_to_rownum.get(str(code))
                 if rn:
-                    current_stock = float(r["stock"])
-                    new_stock = current_stock - float(r["จำนวนที่เบิก"])
+                    # find original stock from df_items
+                    have = float(df_items[df_items["itemcode"].astype(str)==str(code)].iloc[0].get("stock") or 0)
+                    new_stock = have - float(qty)
                     batch_updates.append({"range": f"{chr(ord('A')+stock_idx)}{rn}", "values": [[new_stock]]})
             if batch_updates:
                 ws.batch_update([{"range": u["range"], "values": u["values"]} for u in batch_updates])
-            st.success(f"บันทึกการเบิก {len(rows)} รายการเรียบร้อย (เลขที่ {txid})")
-            st.session_state["cart"] = {}
-            _safe_rerun()
+
+            st.success(f"บันทึกการเบิกเรียบร้อย เลขที่ออเดอร์: **{order_id}** | รายการ: {len(rows)}")
+            # Clear selections
+            for code,_ in chosen:
+                st.session_state[f"sel_{code}"] = False
+                st.session_state[f"qty_{code}"] = 0
+            st.session_state["sel_map"] = {}
+            st.session_state["qty_map"] = {}
         except Exception as e:
             st.error(f"ไม่สามารถบันทึกการเบิกได้: {e}")
+
+    # Recent history
+    with st.expander("ประวัติการเบิกล่าสุด (20 ออเดอร์ล่าสุด)"):
+        try:
+            ws = _ensure_transactions_sheet(ss)
+            vals = ws.get_all_values()
+            if vals and len(vals) > 1:
+                df_tx = pd.DataFrame(vals[1:], columns=vals[0])
+                df_tx = _normalize_cols(df_tx.rename(columns={"txid":"txid"}))
+                # Keep only current user
+                df_tx = df_tx[df_tx["username"].astype(str).str.lower() == str(user.get("username","")).lower()]
+                # group by TxID/OrderID
+                if "txid" in df_tx.columns:
+                    grp = df_tx.groupby("txid").agg({"qty":"sum","txtime":"max"}).reset_index().sort_values("txtime", ascending=False).head(20)
+                    grp = grp.rename(columns={"txid":"เลขที่ออเดอร์","qty":"จำนวนรวม","txtime":"เวลา"})
+                    st.dataframe(grp, use_container_width=True, hide_index=True)
+                else:
+                    st.info("ไม่มีข้อมูล TxID ใน Transactions")
+            else:
+                st.info("ยังไม่มีประวัติ")
+        except Exception as e:
+            st.error(f"อ่านประวัติไม่สำเร็จ: {e}")
 
 
 # ----------------------------- Main / Routing -------------------------------
@@ -474,7 +548,8 @@ def main():
         elif menu == "ออกจากระบบ":
             st.session_state["auth"] = False
             st.session_state["user"] = {}
-            st.session_state["cart"] = {}
+            st.session_state["qty_map"] = {}
+            st.session_state["sel_map"] = {}
             st.success("ออกจากระบบแล้ว")
             _safe_rerun()
         else:
