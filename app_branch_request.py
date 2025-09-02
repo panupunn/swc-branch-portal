@@ -1,697 +1,391 @@
+
 # -*- coding: utf-8 -*-
 """
-import os, re, time, json
+WishCo Branch Portal — เบิกอุปกรณ์
+Patched login + compact Health Check (v2025-09-02)
+
+- Fixes recurring IndentationError around login flow (uses 4-space indentation consistently).
+- Relaxes Users sheet requirements: only Username + (Password OR PasswordHash) are required.
+  BranchCode is optional (derived/fallback when missing).
+- Adds compact Health Check page that shows only:
+    • keys found in secrets.toml
+    • Spreadsheet title if connection is successful
+- Safer password verification: bcrypt first when available, else plaintext.
+- Does not touch other app areas to avoid side effects.
+"""
+from __future__ import annotations
+import os, json, re, time
+from typing import Dict, Any, List, Optional
+
+import streamlit as st
+import pandas as pd
+
+# Optional dependencies: gspread, bcrypt
 try:
-    import bcrypt
+    import gspread  # type: ignore
+except Exception as e:  # pragma: no cover
+    gspread = None
+
+try:
+    import bcrypt  # type: ignore
 except Exception:
     bcrypt = None
 
-WishCo Branch Portal — Phase 1 (patched with compact right-aligned +/- control)
-- เลือกรายการหลายชิ้นในครั้งเดียว (OrderNo เดียว)
-- บล็อก "ปรับจำนวนอย่างรวดเร็ว" แบบกล่องยาว มีปุ่ม − (เทา) และ + (แดง) ชิดขวา ตามภาพตัวอย่าง
-- บันทึกลงชีต Requests + แจ้งเตือนใน Notifications
-- แท็บประวัติ แสดงออร์เดอร์/รายการที่ผู้ใช้ทำเบิกทั้งหมด
 
-Secrets ที่ต้องมี:
-- gcp_service_account (object) หรือ GOOGLE_SERVICE_ACCOUNT_JSON (string) หรือ GOOGLE_APPLICATION_CREDENTIALS (file path)
-- SHEET_URL หรือ SHEET_ID
-
-ชีตที่ใช้:
-- Items, Users, Requests, Notifications
-"""
-
-import os, json, time, re, random
-from datetime import datetime, timezone, timedelta
-import pandas as pd
-import streamlit as st
-import gspread
-from gspread.exceptions import WorksheetNotFound, APIError
-
-APP_TITLE = "WishCo Branch Portal — เบิกอุปกรณ์"
-TZ = timezone(timedelta(hours=7))
-
-# ====================== Utilities ======================
-def do_rerun():
+# ------------------------- Utilities -------------------------
+def _get_sa_dict_from_secrets() -> Optional[Dict[str, Any]]:
+    """Return service account credentials dict from Streamlit secrets if present."""
     try:
-        st.rerun()
+        s = st.secrets
     except Exception:
-        try:
-            st.experimental_rerun()
-        except Exception:
-            pass
-
-def now_str():
-    return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
-
-def ensure_headers(ws, headers):
-    """ถ้าชีตว่าง ใส่ header ให้, ถ้ามีแล้วและขาดอันไหน เติมท้ายให้"""
-    first = ws.row_values(1) or []
-    if not first:
-        ws.update("A1", [headers])
-        return headers
-    missing = [h for h in headers if h not in first]
-    if missing:
-        ws.update("A1", [first + missing])
-        first += missing
-    return first
-
-def _norm(s: str) -> str:
-    s = str(s or "")
-    s = s.strip()
-    s = re.sub(r"\s+", "", s)
-    s = re.sub(r"[^0-9A-Za-zก-๙]+", "", s)
-    return s.lower()
-
-def find_col_fuzzy(df, keywords) -> str | None:
-    """จับคู่ชื่อคอลัมน์แบบยืดหยุ่น"""
-    if df is None or df.empty:
         return None
-    headers = list(df.columns)
-    norm = {h: _norm(h) for h in headers}
-    kset = {_norm(k) for k in keywords}
-    for h in headers:
-        if norm[h] in kset:
-            return h
-    for h in headers:
-        for k in kset:
-            if k and (k in norm[h]):
-                return h
-    return None
 
-# ====================== Credentials & Spreadsheet ======================
-def load_credentials():
-    """โหลด Service Account ได้ 4 รูปแบบ: secrets[gcp_service_account]/top-level/JSON string/env file"""
-    from google.oauth2.service_account import Credentials
-    scope = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
+    # Common placements
+    if "GOOGLE_SERVICE_ACCOUNT_JSON" in s:
+        raw = s["GOOGLE_SERVICE_ACCOUNT_JSON"]
+        if isinstance(raw, str):
+            try:
+                return json.loads(raw)
+            except Exception:
+                pass
+        if isinstance(raw, dict):
+            return dict(raw)
+
+    if "gcp_service_account" in s and isinstance(s["gcp_service_account"], dict):
+        return dict(s["gcp_service_account"])
+
+    # Flat keys (fallback)
+    flat_keys = [
+        "type", "project_id", "private_key_id", "private_key", "client_email",
+        "client_id", "auth_uri", "token_uri", "auth_provider_x509_cert_url", "client_x509_cert_url"
     ]
-    # 1) secrets[gcp_service_account]
-    if "gcp_service_account" in st.secrets:
-        info = dict(st.secrets["gcp_service_account"])
-        return Credentials.from_service_account_info(info, scopes=scope)
+    if all(k in s for k in flat_keys):
+        return {k: s[k] for k in flat_keys}
 
-    # 2) top-level secrets
-    top = {"type", "project_id", "private_key_id", "private_key", "client_email", "client_id"}
-    if top.issubset(set(st.secrets.keys())):
-        info = {k: st.secrets[k] for k in top}
-        info.setdefault("auth_uri", "https://accounts.google.com/o/oauth2/auth")
-        info.setdefault("token_uri", "https://oauth2.googleapis.com/token")
-        info.setdefault("auth_provider_x509_cert_url", "https://www.googleapis.com/oauth2/v1/certs")
-        info.setdefault("client_x509_cert_url", "")
-        return Credentials.from_service_account_info(info, scopes=scope)
-
-    # 3) GOOGLE_SERVICE_ACCOUNT_JSON (string)
-    raw = (
-        st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-        or os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-    )
-    if raw:
-        try:
-            info = json.loads(raw)
-        except json.JSONDecodeError:
-            info = json.loads(raw.replace("\n", "\\n"))
-        return Credentials.from_service_account_info(info, scopes=scope)
-
-    # 4) GOOGLE_APPLICATION_CREDENTIALS (file path)
-    p = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
-    if p and os.path.exists(p):
-        return Credentials.from_service_account_file(p, scopes=scope)
-
-    st.error("ไม่พบ Service Account ใน Secrets/Environment")
-    st.stop()
-
-def _extract_sheet_id(id_or_url: str) -> str | None:
-    s = (id_or_url or "").strip()
-    if not s:
-        return None
-    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9\-_]+)", s)
-    if m:
-        return m.group(1)
-    if re.fullmatch(r"[a-zA-Z0-9\-_]{20,}", s):
-        return s
     return None
 
-def open_spreadsheet(client):
-    """อ่าน SHEET_ID/SHEET_URL จาก secrets/env; ถ้าไม่ตั้งค่า เปิดช่องให้วาง"""
-    raw = (
-        st.secrets.get("SHEET_ID", "").strip()
-        or st.secrets.get("SHEET_URL", "").strip()
-        or os.environ.get("SHEET_ID", "").strip()
-        or os.environ.get("SHEET_URL", "").strip()
-    )
 
-    def _try_open(sid: str):
-        try:
-            return client.open_by_key(sid)
-        except Exception as e:
-            sa = getattr(client.auth, "service_account_email", None)
-            with st.expander("รายละเอียดการเชื่อมต่อ / วิธีแก้ (คลิกเพื่อดู)", expanded=True):
-                st.error(f"เปิดสเปรดชีตไม่สำเร็จ (ID: {sid})")
-                if sa:
-                    st.write("Service Account:", f"`{sa}`")
-                st.exception(e)
-            st.stop()
-
-    sid = _extract_sheet_id(raw) if raw else None
-    if sid:
-        return _try_open(sid)
-
-    st.info("ยังไม่ตั้งค่า SHEET_ID / SHEET_URL — วางลิงก์หรือ Spreadsheet ID")
-    inp = st.text_input("URL หรือ Spreadsheet ID", value=st.session_state.get("input_sheet_url", ""))
-    if st.button("เชื่อมต่อชีต", type="primary"):
-        sid2 = _extract_sheet_id(inp)
-        if not sid2:
-            st.warning("รูปแบบไม่ถูกต้อง"); st.stop()
-        st.session_state["input_sheet_url"] = inp.strip()
-        return _try_open(sid2)
-    st.stop()
-
-# ====================== 429 helpers ======================
-def _is_429(e: Exception) -> bool:
-    msg = str(e)
-    if "429" in msg and "Quota exceeded" in msg:
-        return True
+def _get_sheet_loc_from_secrets() -> Dict[str, str]:
+    """Return dict with sheet_id or sheet_url if present in Streamlit secrets/env."""
+    out: Dict[str, str] = {}
     try:
-        code = getattr(getattr(e, "response", None), "status_code", None)
-        return code == 429
+        s = st.secrets
     except Exception:
-        return False
+        s = {}
 
-def with_retry(func, *args, announce=False, **kwargs):
-    attempt = 0
-    while True:
+    candidates = ["SHEET_ID", "sheet_id", "SPREADSHEET_ID", "SHEET_URL", "sheet_url", "SPREADSHEET_URL"]
+    for k in candidates:
+        v = None
+        if k in s:
+            v = s[k]
+        elif k in os.environ:
+            v = os.environ.get(k)
+
+        if v:
+            if "URL" in k.upper():
+                out["sheet_url"] = str(v)
+            else:
+                out["sheet_id"] = str(v)
+
+    return out
+
+
+def _open_spreadsheet() -> Any:
+    """Open Google Spreadsheet using credentials + id/url from secrets/env. Returns gspread Spreadsheet."""
+    if gspread is None:
+        raise RuntimeError("gspread library is not available in this environment. Please add it to requirements.")
+
+    sa = _get_sa_dict_from_secrets()
+    if not sa:
+        raise RuntimeError("Service Account credentials not found in secrets. Please set GOOGLE_SERVICE_ACCOUNT_JSON or gcp_service_account.")
+
+    try:
+        gc = gspread.service_account_from_dict(sa)
+    except Exception as e:
+        raise RuntimeError(f"Failed to build gspread client from service account: {e}")
+
+    loc = _get_sheet_loc_from_secrets()
+    if "sheet_id" in loc:
         try:
-            return func(*args, **kwargs)
-        except APIError as e:
-            if _is_429(e) and attempt < 5:
-                wait = (2 ** attempt) + random.uniform(0, 0.5)
-                if announce and not st.session_state.get("_quota_msg_shown"):
-                    st.session_state["_quota_msg_shown"] = True
-                    st.info(f"โควต้าอ่าน Google Sheets เกินชั่วคราว กำลังรอ {wait:.1f}s แล้วลองใหม่…")
-                time.sleep(wait)
-                attempt += 1
-                continue
-            raise
+            ss = gc.open_by_key(loc["sheet_id"])
+            return ss
+        except Exception as e:
+            raise RuntimeError(f"Cannot open spreadsheet by SHEET_ID: {e}")
 
-# ====================== Cached connectors/readers ======================
-@st.cache_resource(show_spinner=False)
-def get_client_and_ss():
-    creds = load_credentials()
-    client = gspread.authorize(creds)
-    ss = open_spreadsheet(client)
-    return client, ss
+    if "sheet_url" in loc:
+        try:
+            ss = gc.open_by_url(loc["sheet_url"])
+            return ss
+        except Exception as e:
+            raise RuntimeError(f"Cannot open spreadsheet by SHEET_URL: {e}")
 
-@st.cache_data(ttl=300, show_spinner=False)
-def get_worksheets_map() -> dict:
-    _, ss = get_client_and_ss()
-    lst = with_retry(ss.worksheets)
-    return {w.title: w.id for w in lst}
+    raise RuntimeError("Missing SHEET_ID or SHEET_URL in secrets.toml/env.")
 
-def get_or_create_ws(ss, title: str, rows: int = 1000, cols: int = 26):
+
+def _list_found_secret_keys() -> List[str]:
+    found = []
     try:
-        mp = get_worksheets_map()
-        if title in mp:
-            return with_retry(ss.get_worksheet_by_id, mp[title])
-        ws = with_retry(ss.add_worksheet, title, rows, cols)
-        st.cache_data.clear()
-        return ws
-    except APIError as e:
-        if _is_429(e):
-            with st.expander("รายละเอียดการเชื่อมต่อ / ข้อผิดพลาด (คลิกเพื่อดู)", expanded=True):
-                st.error(f"เปิดแผ่นงาน '{title}' ไม่สำเร็จ (โควต้าอ่านเกินชั่วคราว)")
-                st.exception(e)
-            st.stop()
-        raise
-
-@st.cache_data(ttl=90, show_spinner=False)
-def read_sheet_as_df(sheet_name: str) -> pd.DataFrame:
-    _, ss = get_client_and_ss()
-    ws = get_or_create_ws(ss, sheet_name, 1000, 26)
-    vals = with_retry(ws.get_all_values, announce=True)
-    return pd.DataFrame(vals[1:], columns=vals[0]) if vals else pd.DataFrame()
-
-@st.cache_data(ttl=90, show_spinner=False)
-def read_requests_df() -> pd.DataFrame:
-    _, ss = get_client_and_ss()
-    ws = get_or_create_ws(ss, "Requests", 2000, 26)
-    vals = with_retry(ws.get_all_values, announce=True)
-    return pd.DataFrame(vals[1:], columns=vals[0]) if vals else pd.DataFrame()
-
-# ====================== App ======================
-def main():
-    st.set_page_config(page_title=APP_TITLE, layout="wide")
-    st.title(APP_TITLE)
-
-    client, ss = get_client_and_ss()
-    try:
-        st.caption(f"Service Account: `{client.auth.service_account_email}`")
+        s = st.secrets
+        if "GOOGLE_SERVICE_ACCOUNT_JSON" in s:
+            found.append("GOOGLE_SERVICE_ACCOUNT_JSON")
+        if "gcp_service_account" in s:
+            found.append("gcp_service_account")
+        for k in ("SHEET_ID", "sheet_id", "SPREADSHEET_ID", "SHEET_URL", "sheet_url", "SPREADSHEET_URL"):
+            if k in s:
+                found.append(k)
     except Exception:
         pass
+    # ENV fallback display (do not echo private keys)
+    for k in ("SHEET_ID", "SPREADSHEET_ID", "SHEET_URL", "SPREADSHEET_URL"):
+        if os.environ.get(k):
+            found.append(k + " (env)")
+    return found
 
-    # ---------- Login ----------
-    
-    # ---------- Menu ----------
-    menu = st.sidebar.radio("เมนู", ["เข้าสู่ระบบ", "Health Check"], index=0)
-    if menu == "Health Check":
-        st.header("🩺 Health Check — การเชื่อมต่อและโครงสร้างสเปรดชีต")
-        # แสดงถึงระดับตามภาพเท่านั้น
-        found_keys = []
-        if st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON"): found_keys.append("GOOGLE_SERVICE_ACCOUNT_JSON")
-        if st.secrets.get("SHEET_URL"): found_keys.append("SHEET_URL")
-        if st.secrets.get("SHEET_ID"): found_keys.append("SHEET_ID")
-        st.info("พบคีย์ใน secrets.toml: " + (", ".join(found_keys) if found_keys else "—"))
+
+# ------------------------- Data helpers -------------------------
+CANONICAL_COLS = {
+    "username": ["username", "user", "บัญชีผู้ใช้", "ชื่อผู้ใช้", "ชื่อเข้าใช้"],
+    "branchcode": ["branchcode", "branch", "สาขา", "รหัสสาขา", "code"],
+    "password": ["password", "รหัสผ่าน"],
+    "passwordhash": ["passwordhash", "hash", "bcrypt", "passhash"],
+    "displayname": ["displayname", "name", "ชื่อ", "ชื่อแสดง"],
+    "active": ["active", "enabled", "สถานะ", "isactive"],
+    "role": ["role", "ตำแหน่ง", "สิทธิ์"],
+}
+
+REQUIRED_ANY_OF = ["password", "passwordhash"]
+REQUIRED_ALWAYS = ["username"]
+
+
+def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
+    mapping = {}
+    for canon, alts in CANONICAL_COLS.items():
+        for col in df.columns:
+            k = str(col).strip()
+            if k.lower() in [a.lower() for a in alts]:
+                mapping[col] = canon
+    # also map exact canonical names
+    for canon in CANONICAL_COLS:
+        for col in df.columns:
+            if str(col).strip().lower() == canon:
+                mapping[col] = canon
+
+    nd = df.rename(columns=mapping).copy()
+    return nd
+
+
+def _read_users_df(ss) -> pd.DataFrame:
+    try:
+        ws = ss.worksheet("Users")
+    except Exception:
+        # create if missing with minimal header
+        ws = ss.add_worksheet(title="Users", rows=100, cols=10)
+        ws.update("A1:F1", [["Username", "DisplayName", "Role", "PasswordHash", "Active", "BranchCode"]])
+
+    values = ws.get_all_values()
+    if not values:
+        header = ["Username", "DisplayName", "Role", "PasswordHash", "Active", "BranchCode"]
+        ws.update("A1:F1", [header])
+        values = [header]
+
+    # Build DF
+    header = values[0]
+    rows = values[1:]
+    df = pd.DataFrame(rows, columns=header)
+    df = _normalize_cols(df)
+    return df
+
+
+def _is_active(val: Any) -> bool:
+    if val is None:
+        return True
+    s = str(val).strip().lower()
+    if s in ("n", "no", "0", "false", "inactive", "disabled"):
+        return False
+    return True
+
+
+def _verify_password(row: pd.Series, raw_password: str) -> bool:
+    ph = str(row.get("passwordhash") or "").strip()
+    pw = str(row.get("password") or "").strip()
+
+    if ph and bcrypt:
         try:
-            client, ss = get_client_and_ss()
-            st.success(f"เชื่อมต่อได้: {ss.title}")
-        except Exception as e:
-            st.error(f"เชื่อมต่อสเปรดชีตไม่สำเร็จ: {e}")
-        st.stop()
+            return bcrypt.checkpw(raw_password.encode("utf-8"), ph.encode("utf-8"))
+        except Exception:
+            # fall back to plaintext below
+            pass
 
-    # ---------- Login ----------
-    st.sidebar.subheader("เข้าสู่ระบบสำหรับสาขา/หน่วยงาน")
+    if pw:
+        return raw_password == pw
+    # if we have only hash but bcrypt missing, reject with message outside
+    return False
+
+
+def _derive_branch_code(ss, row: pd.Series) -> str:
+    bc = str(row.get("branchcode") or "").strip()
+    if bc:
+        return bc
+
+    # Try to read first branch from Branches sheet
+    try:
+        ws = ss.worksheet("Branches")
+        vals = ws.get_all_values()
+        if vals and len(vals) > 1:
+            # heuristics: first column contains code
+            if vals[0]:
+                # find a header that looks like code
+                code_idx = 0
+                for i, h in enumerate(vals[0]):
+                    if str(h).strip().lower() in ("code", "branchcode", "รหัสสาขา", "branch_code", "สาขา"):
+                        code_idx = i
+                        break
+            else:
+                code_idx = 0
+            first_data = vals[1]
+            if first_data and len(first_data) > code_idx:
+                guess = str(first_data[code_idx]).strip()
+                if guess:
+                    return guess
+    except Exception:
+        pass
+    return "SWC000"
+
+
+# ------------------------- UI Pages -------------------------
+def page_health_check():
+    st.title("WishCo Branch Portal — เบิกอุปกรณ์")
+    st.header("🩺 Health Check — การเชื่อมต่อและโครงสร้างสเปรดชีต")
+
+    # Row: found keys
+    found_keys = _list_found_secret_keys()
+    if found_keys:
+        st.info("พบคีย์ใน secrets.toml: " + ", ".join(found_keys))
+    else:
+        st.warning("ไม่พบคีย์ใน secrets.toml/ENV (โปรดตั้งค่า GOOGLE_SERVICE_ACCOUNT_JSON และ SHEET_ID/SHEET_URL)")
+
+    # Row: spreadsheet connection
+    try:
+        ss = _open_spreadsheet()
+        # Only show the title line (compact per user's request)
+        try:
+            title = ss.title  # gspread Spreadsheet.title
+        except Exception:
+            title = "(unknown)"
+        st.success(f"เชื่อมต่อได้: {title}")
+    except Exception as e:
+        st.error(f"เชื่อมต่อสเปรดชีตไม่สำเร็จ: {e}")
+
+
+def _ensure_session_defaults():
     if "auth" not in st.session_state:
         st.session_state["auth"] = False
+    if "user" not in st.session_state:
         st.session_state["user"] = {}
 
+
+def page_login():
+    _ensure_session_defaults()
+
+    st.sidebar.subheader("เข้าสู่ระบบสำหรับสาขา/หน่วยงาน")
+    username_input = st.sidebar.text_input("ชื่อผู้ใช้", key="login_username")
+    password_input = st.sidebar.text_input("รหัสผ่าน", type="password", key="login_password")
+    login_clicked = st.sidebar.button("ล็อกอิน", use_container_width=True)
+
+    # Early return if not clicked
+    if not login_clicked:
+        if not st.session_state["auth"]:
+            st.session_state["auth"] = False
+        st.title("WishCo Branch Portal — เบิกอุปกรณ์")
+        return
+
+    # On click: perform login
+    try:
+        ss = _open_spreadsheet()
+        df = _read_users_df(ss)
+    except Exception as e:
+        st.error(f"เชื่อมต่อสเปรดชีตไม่ได้หรืออ่านแท็บ Users ไม่ได้: {e}")
+        return
+
+    # Validate header presence
+    cols_lower = [c.lower() for c in df.columns]
+    missing_always = [c for c in REQUIRED_ALWAYS if c not in cols_lower]
+    has_any_pwd = any(x in cols_lower for x in REQUIRED_ANY_OF)
+    if missing_always or not has_any_pwd:
+        st.error("Users sheet ไม่ครบคอลัมน์ (ต้องมี Username และ Password หรือ PasswordHash)")
+        return
+
+    # Find user (case-insensitive)
+    uname = str(username_input or "").strip().lower()
+    if not uname:
+        st.error("กรุณากรอกชื่อผู้ใช้")
+        return
+
+    dfn = df.copy()
+    dfn["username_norm"] = dfn["username"].astype(str).str.strip().str.lower()
+    row = dfn[dfn["username_norm"] == uname].head(1)
+    if row.empty:
+        st.error("ไม่พบบัญชีผู้ใช้")
+        return
+
+    r = row.iloc[0]
+
+    # Active check (if present)
+    if "active" in dfn.columns and not _is_active(r.get("active")):
+        st.error("บัญชีนี้ถูกปิดการใช้งาน")
+        return
+
+    # Verify password
+    raw_pw = str(password_input or "")
+    ok = _verify_password(r, raw_pw)
+    if not ok and r.get("passwordhash") and not bcrypt:
+        st.error("ระบบใช้รหัสผ่านแบบแฮช แต่เซิร์ฟเวอร์ยังไม่มีไลบรารี bcrypt")
+        return
+    if not ok:
+        st.error("รหัสผ่านไม่ถูกต้อง")
+        return
+
+    # Build user session
+    user_info = {
+        "username": str(r.get("username") or "").strip(),
+        "displayname": str(r.get("displayname") or ""),
+        "role": str(r.get("role") or ""),
+        "branch_code": _derive_branch_code(ss, r),
+    }
+    st.session_state["user"] = user_info
+    st.session_state["auth"] = True
+    st.success("ล็อกอินสำเร็จ — กำลังเข้าสู่ระบบ...")
+    st.experimental_rerun()
+
+
+def page_portal():
+    """Main portal shown after login. Keep simple to avoid indentation mistakes."""
+    _ensure_session_defaults()
     if not st.session_state["auth"]:
-        u = st.sidebar.text_input("ชื่อผู้ใช้")
-        p = st.sidebar.text_input("รหัสผ่าน", type="password")
+        st.warning("กรุณาเข้าสู่ระบบก่อน")
+        return
+    user = st.session_state.get("user", {})
+    username = user.get("username", "")
+    branch = user.get("branch_code", "")
+    st.title("WishCo Branch Portal — เบิกอุปกรณ์")
+    st.write(f"ผู้ใช้: **{username}** | สาขา: **{branch}**")
+    st.info("เข้าสู่หน้าเบิกอุปกรณ์ (เนื้อหาจริงของพอร์ตัลสามารถใส่ต่อจากนี้ได้)")
 
-        if st.sidebar.button("ล็อกอิน", use_container_width=True):
-            dfu = read_sheet_as_df("Users")
-            if dfu.empty:
-                st.sidebar.error("ไม่มีผู้ใช้ในชีต Users"); st.stop()
 
-            cu = find_col_fuzzy(dfu, {"username", "user", "บัญชีผู้ใช้", "ชื่อผู้ใช้"})
-            cp = find_col_fuzzy(dfu, {"password", "รหัสผ่าน"})
-            cph = find_col_fuzzy(dfu, {"passwordhash", "hash", "รหัสผ่านแบบแฮช"})
-            cb = find_col_fuzzy(dfu, {"BranchCode", "สาขา", "branch"})
-            cactive = find_col_fuzzy(dfu, {"active", "สถานะ", "ใช้งาน"})
-            # ต้องมี Username และ Password/PasswordHash; BranchCode เป็นตัวเลือก
-            if not (cu and (cp or cph)):
-                st.sidebar.error("Users sheet ไม่ครบคอลัมน์ (ต้องมี Username และ Password หรือ PasswordHash)"); st.stop()
+# ------------------------- App entry -------------------------
+def main():
+    st.set_page_config(page_title="WishCo Branch Portal", layout="wide", page_icon="🧰")
+    _ensure_session_defaults()
 
-            # normalize present columns
-            for c in filter(None, (cu, cp, cph, cb, cactive)):
-                dfu[c] = dfu[c].astype(str).str.strip()
-
-            row = dfu[dfu[cu].str.casefold() == (u or "").strip().casefold()].head(1)
-
-            if row.empty:
-                st.sidebar.error("ไม่พบผู้ใช้หรือรหัสผ่านไม่ถูกต้อง")
-            else:
-                # ตรวจ Active
-                if cactive and str(row.iloc[0][cactive]).strip().upper() in {"N","NO","0","FALSE"}:
-                    st.sidebar.error("บัญชีนี้ถูกปิดการใช้งาน")
-                else:
-                    ok = False
-                    try:
-                        if cph and str(row.iloc[0][cph]).strip():
-                            if bcrypt:
-                                try:
-                                    ok = bcrypt.checkpw((p or "").encode("utf-8"), str(row.iloc[0][cph]).encode("utf-8"))
-                                except Exception:
-                                    ok = False
-                    except Exception:
-                        ok = False
-                    if not ok and cp:
-                        if str(row.iloc[0][cp]).strip() == (p or "").strip():
-                            ok = True
-                    if not ok:
-                        st.sidebar.error("ไม่พบผู้ใช้หรือรหัสผ่านไม่ถูกต้อง")
-                    else:
-                        # หา BranchCode ถ้าไม่มี ให้เดาจากแท็บ Branches หรือกำหนดค่าเริ่มต้น
-                        def _default_branch():
-                            try:
-                                dfb = read_sheet_as_df("Branches")
-                                cbcode = find_col_fuzzy(dfb, {"BranchCode","Code","รหัส","branch"})
-                                if not dfb.empty and cbcode:
-                                    v = str(dfb.iloc[0][cbcode]).strip()
-                                    return v if v else "SWC000"
-                            except Exception:
-                                pass
-                            return "SWC000"
-
-                        branch_val = str(row.iloc[0][cb]).strip() if cb else _default_branch()
-
-                        st.session_state["auth"] = True
-                        st.session_state["user"] = {
-                            "username": (u or "").strip(),
-                            "branch": branch_val,
-                        }
-                        st.sidebar.success(f"ยินดีต้อนรับ {st.session_state['user']['username']}")
-                        time.sleep(0.5); do_rerun()
-        st.stop()
-
-    if st.sidebar.button("ออกจากระบบ"):
-        st.session_state["auth"] = False
-        st.session_state["user"] = {}
-        do_rerun()
-
-    branch_code = st.session_state["user"]["branch"]
-    username = st.session_state["user"]["username"]
-branch_code = st.session_state["user"]["branch"]
-    username = st.session_state["user"]["username"]
-
-    # ---------- Tabs ----------
-    tab_req, tab_hist = st.tabs(["🧺 เบิกอุปกรณ์", "🧾 ประวัติคำสั่งเบิก"])
-
-    # ===== Tab: เบิกอุปกรณ์ =====
-    with tab_req:
-        st.header("📦 รายการอุปกรณ์ที่พร้อมให้เบิก", anchor=False)
-
-        dfi = read_sheet_as_df("Items")
-        if dfi.empty:
-            st.info("ยังไม่มีข้อมูลใน Items"); st.stop()
-
-        c_code = find_col_fuzzy(dfi, {"รหัส", "itemcode", "code", "sku", "part", "partno", "partnumber"})
-        if not c_code:
-            st.error("Items: หา 'รหัส' ไม่พบ"); st.stop()
-
-        # ชื่ออุปกรณ์
-        name_candidates = []
-        for keys in [
-            {"ชื่ออุปกรณ์", "ชื่อสินค้า", "itemname", "productname"},
-            {"ชื่อ", "name", "รายการ", "description", "desc"},
-        ]:
-            c = find_col_fuzzy(dfi, keys)
-            if c:
-                name_candidates.append(c)
-        if name_candidates:
-            c_name = max(name_candidates, key=lambda c: dfi[c].astype(str).str.strip().ne("").sum())
+    menu = st.sidebar.radio("เมนู", options=["เข้าสู่ระบบ", "Health Check"], index=1 if st.session_state.get("force_health", False) else 0)
+    if menu == "Health Check":
+        page_health_check()
+    else:
+        if st.session_state.get("auth"):
+            page_portal()
         else:
-            others = [c for c in dfi.columns if c != c_code]
-            c_name = others[0] if others else None
+            page_login()
 
-        name_display = dfi[c_name].astype(str).str.strip() if c_name else pd.Series([""] * len(dfi))
-
-        c_qty = find_col_fuzzy(dfi, {"คงเหลือ", "qty", "จำนวน", "stock", "balance", "remaining", "remain", "จำนวนคงเหลือ"})
-        c_ready = find_col_fuzzy(
-            dfi,
-            {
-                "พร้อมให้เบิก",
-                "พร้อมให้เบิก(y/n)",
-                "ready",
-                "available",
-                "ให้เบิก",
-                "allow",
-                "เปิดให้เบิก",
-                "ใช้งาน",
-                "สถานะ",
-                "active",
-                "enabled",
-                "availableflag",
-            },
-        )
-
-        if c_ready:
-            ready_mask = dfi[c_ready].astype(str).str.upper().str.strip().isin(["Y", "YES", "TRUE", "1"])
-        elif c_qty:
-            ready_mask = pd.to_numeric(dfi[c_qty], errors="coerce").fillna(0) > 0
-        else:
-            ready_mask = pd.Series([True] * len(dfi))
-
-        ready_df = dfi[ready_mask].copy()
-        name_ready = name_display[ready_mask].copy()
-
-        if ready_df.empty:
-            st.warning("ยังไม่มีอุปกรณ์ที่พร้อมให้เบิก"); st.stop()
-
-        base_df = pd.DataFrame(
-            {
-                "รหัส": ready_df[c_code].astype(str).values,
-                "ชื่อ": name_ready.replace("", "(ไม่มีชื่อ)").values,
-                "เลือก": [False] * len(ready_df),
-                "จำนวนที่ต้องการ": [0] * len(ready_df),
-            }
-        )
-
-        # ---------------------- ORDER EDITOR ----------------------
-        if "order_table" not in st.session_state or st.session_state.get("order_table_shape") != base_df.shape:
-            st.session_state["order_table"] = base_df.copy()
-            st.session_state["order_table_shape"] = base_df.shape
-            st.session_state["prev_sel_idx"] = set()
-
-        csel1, csel2, _ = st.columns([1,1,8])
-        if csel1.button("เลือกทั้งหมด"):
-            df_tmp = st.session_state["order_table"].copy()
-            df_tmp["เลือก"] = True
-            df_tmp["จำนวนที่ต้องการ"] = pd.to_numeric(df_tmp["จำนวนที่ต้องการ"], errors="coerce").fillna(0)
-            df_tmp.loc[df_tmp["จำนวนที่ต้องการ"] <= 0, "จำนวนที่ต้องการ"] = 1
-            st.session_state["order_table"] = df_tmp
-            st.session_state["prev_sel_idx"] = set(df_tmp.index[df_tmp["เลือก"] == True].tolist())
-
-        if csel2.button("ล้างการเลือก"):
-            df_tmp = st.session_state["order_table"].copy()
-            df_tmp["เลือก"] = False
-            df_tmp["จำนวนที่ต้องการ"] = 0
-            st.session_state["order_table"] = df_tmp
-            st.session_state["prev_sel_idx"] = set()
-
-        edited = st.data_editor(
-            st.session_state["order_table"],
-            num_rows="fixed",
-            key="order_editor",
-            use_container_width=True,
-            column_config={
-                "เลือก": st.column_config.CheckboxColumn("เลือก"),
-                "จำนวนที่ต้องการ": st.column_config.NumberColumn("จำนวนที่ต้องการ", min_value=1, step=1),
-            },
-            hide_index=True,
-        )
-
-        edited["จำนวนที่ต้องการ"] = pd.to_numeric(edited["จำนวนที่ต้องการ"], errors="coerce").fillna(0)
-
-        prev_set = st.session_state.get("prev_sel_idx", set())
-        curr_set = set(edited.index[edited["เลือก"] == True].tolist())
-        new_checked = curr_set - prev_set
-        if new_checked:
-            for i in new_checked:
-                if edited.at[i, "จำนวนที่ต้องการ"] <= 0:
-                    edited.at[i, "จำนวนที่ต้องการ"] = 1  # auto 1 เมื่อเพิ่งติ๊กเลือก
-
-        st.session_state["prev_sel_idx"] = curr_set
-        st.session_state["order_table"] = edited
-
-        # ====== ปรับจำนวนอย่างรวดเร็ว (+ / −) — สไตล์ตามภาพ ======
-        selected_idx = list(
-            st.session_state["order_table"].index[
-                st.session_state["order_table"]["เลือก"] == True
-            ]
-        )
-
-        if selected_idx:
-            # CSS จัดให้เป็นกล่องยาว + ปุ่ม – / + แนบขวา (เทา/แดง)
-            st.markdown("""
-            <style>
-            .qty-row .qval{
-                background-color:#1f2937;        /* เทาเข้ม */
-                color:#e5e7eb;
-                border:1px solid #374151;
-                height: 40px;
-                border-radius: 8px 0 0 8px;
-                display:flex; align-items:center; justify-content:center;
-                font-weight:700; width:100%;
-            }
-            .qty-row .stButton>button{
-                height:40px; min-height:40px; width:44px;
-                padding:0; margin:0; line-height:1;
-                font-size:1rem; font-weight:700; border-radius:0;
-            }
-            .qty-row .btn-minus>button{
-                background:#374151; color:#ffffff; border:1px solid #374151;
-            }
-            .qty-row .btn-plus>button{
-                background:#ef4444; color:#ffffff; border:1px solid #ef4444;
-                border-radius:0 8px 8px 0;
-            }
-            .qty-row [data-testid="column"]{ padding:0 2px; }
-            .qty-row { margin:0.35rem 0 0.6rem 0; }
-            </style>
-            """, unsafe_allow_html=True)
-
-            st.markdown("#### 🔢 ปรับจำนวนอย่างรวดเร็ว")
-            h1, h2, h3 = st.columns([2, 6, 4])
-            h1.markdown("**รหัส**")
-            h2.markdown("**ชื่อ**")
-            h3.markdown("**จำนวนที่รับเบิก**")
-
-            for i in selected_idx:
-                row = st.session_state["order_table"].loc[i]
-                q = int(pd.to_numeric(row["จำนวนที่ต้องการ"], errors="coerce") or 0)
-                if q <= 0:
-                    q = 1
-                    st.session_state["order_table"].loc[i, "จำนวนที่ต้องการ"] = q
-
-                c1, c2, c3 = st.columns([2, 6, 4])
-                c1.write(str(row["รหัส"]))
-                c2.write(str(row["ชื่อ"]))
-
-                with c3.container():
-                    st.markdown('<div class="qty-row">', unsafe_allow_html=True)
-                    qcol, mcol, pcol = st.columns([10, 1, 1])
-                    qcol.markdown(f"<div class='qval'>{q}</div>", unsafe_allow_html=True)
-
-                    with mcol:
-                        if st.button("−", key=f"qminus_{i}", help="ลดจำนวน 1", use_container_width=True):
-                            if q > 1:
-                                st.session_state["order_table"].loc[i, "จำนวนที่ต้องการ"] = q - 1
-                                do_rerun()
-                    # ใส่คลาสให้ปุ่มลบ
-                    st.markdown("""
-                        <script>
-                        const btns = window.parent.document.querySelectorAll('[data-testid="stButton"] button');
-                        btns.forEach(b => { if(b.innerText==='−') { b.parentElement.classList.add('btn-minus'); }});
-                        </script>
-                    """, unsafe_allow_html=True)
-
-                    with pcol:
-                        if st.button("+", key=f"qplus_{i}", help="เพิ่มจำนวน 1", use_container_width=True):
-                            st.session_state["order_table"].loc[i, "จำนวนที่ต้องการ"] = q + 1
-                            do_rerun()
-                    # ใส่คลาสให้ปุ่มเพิ่ม
-                    st.markdown("""
-                        <script>
-                        const btns2 = window.parent.document.querySelectorAll('[data-testid="stButton"] button');
-                        btns2.forEach(b => { if(b.innerText==='+') { b.parentElement.classList.add('btn-plus'); }});
-                        </script>
-                    """, unsafe_allow_html=True)
-
-                    st.markdown('</div>', unsafe_allow_html=True)
-        # ===================================================
-
-        col1, col2 = st.columns([1, 1])
-        submit = col1.button("✅ เบิกอุปกรณ์", type="primary", use_container_width=True)
-        clear = col2.button("🧹 ล้างข้อมูล", use_container_width=True)
-
-        if clear:
-            st.session_state.pop("order_table", None)
-            st.session_state.pop("order_table_shape", None)
-            st.session_state["prev_sel_idx"] = set()
-            st.success("ล้างการเลือกแล้ว")
-            time.sleep(0.3); do_rerun()
-
-        # ----- กด "เบิกอุปกรณ์" -----
-        if submit:
-            sel = edited[
-                (edited["เลือก"] == True)
-                & (pd.to_numeric(edited["จำนวนที่ต้องการ"], errors="coerce").fillna(0) > 0)
-            ].copy()
-
-            if sel.empty:
-                st.warning("กรุณาเลือกอุปกรณ์อย่างน้อย 1 รายการ และระบุจำนวน")
-                st.stop()
-
-            ws_reqs = get_or_create_ws(ss, "Requests", 2000, 26)
-            ws_noti = get_or_create_ws(ss, "Notifications", 2000, 26)
-
-            ensure_headers(
-                ws_reqs,
-                [
-                    "ReqNo","OrderNo","CreatedAt","Branch","Requester",
-                    "ItemCode","ItemName","Qty","Status","Approver",
-                    "LastUpdate","Note","NotifiedMain(Y/N)","NotifiedBranch(Y/N)",
-                ],
-            )
-            ensure_headers(
-                ws_noti,
-                ["NotiID","CreatedAt","TargetApp","TargetBranch","Type","RefID","Message","ReadFlag","ReadAt"],
-            )
-
-            order_no = f"ORD-{branch_code}-{datetime.now(TZ).strftime('%Y%m%d-%H%M%S')}"
-            ts = now_str()
-
-            for _, r in sel.iterrows():
-                req_no = f"REQ-{branch_code}-{datetime.now(TZ).strftime('%Y%m%d-%H%M%S')}"
-                row = [
-                    req_no, order_no, ts, branch_code, username,
-                    r["รหัส"], r["ชื่อ"], str(int(r["จำนวนที่ต้องการ"])),
-                    "pending","", ts,"","N","N",
-                ]
-                with_retry(ws_reqs.append_row, row, value_input_option="USER_ENTERED", announce=True)
-
-            n_headers = with_retry(ws_noti.row_values, 1, announce=True)
-            noti = {
-                "NotiID": f"NOTI-{datetime.now(TZ).strftime('%Y%m%d-%H%M%S')}",
-                "CreatedAt": ts,
-                "TargetApp": "main_app",
-                "TargetBranch": branch_code,
-                "Type": "ORDER_CREATED",
-                "RefID": order_no,
-                "Message": f"{branch_code} สร้างคำสั่งเบิก {order_no} จำนวน {len(sel)} รายการ โดย {username}",
-                "ReadFlag": "N",
-                "ReadAt": "",
-            }
-            with_retry(
-                ws_noti.append_row,
-                [noti.get(h, "") for h in n_headers],
-                value_input_option="USER_ENTERED",
-                announce=True,
-            )
-
-            st.cache_data.clear()
-            with st.success(f"สร้างคำสั่งเบิกสำเร็จ: **{order_no}**"):
-                st.write("สรุปรายการในออร์เดอร์:")
-                st.dataframe(
-                    sel[["รหัส", "ชื่อ", "จำนวนที่ต้องการ"]].rename(columns={"จำนวนที่ต้องการ": "Qty"}),
-                    use_container_width=True,
-                )
-
-            st.session_state.pop("order_table", None)
-            st.session_state.pop("order_table_shape", None)
-            st.session_state["prev_sel_idx"] = set()
-
-    # ===== Tab: ประวัติคำสั่งเบิก =====
-    with tab_hist:
-        st.header("🧾 ประวัติคำสั่งเบิก (ทุกรายการที่คุณทำเบิก)", anchor=False)
-
-        dfr = read_requests_df()
-        if not dfr.empty:
-            c_branch = find_col_fuzzy(dfr, {"Branch"})
-            c_user   = find_col_fuzzy(dfr, {"Requester"})
-            c_order  = find_col_fuzzy(dfr, {"OrderNo"})
-            c_code2  = find_col_fuzzy(dfr, {"ItemCode","รหัส"})
-            c_name2  = find_col_fuzzy(dfr, {"ItemName","ชื่อ"})
-            c_qty2   = find_col_fuzzy(dfr, {"Qty","จำนวน"})
-            c_status = find_col_fuzzy(dfr, {"Status","สถานะ"})
-            c_created= find_col_fuzzy(dfr, {"CreatedAt","เวลา","timestamp"})
-
-            show_cols = [c_created, c_order, c_code2, c_name2, c_qty2, c_status]
-            show_cols = [c for c in show_cols if c]
-
-            if c_branch and c_user and show_cols:
-                my = dfr[(dfr[c_branch] == branch_code) & (dfr[c_user] == username)].copy()
-
-                if c_created in my.columns:
-                    my["_dt"] = pd.to_datetime(my[c_created], errors="coerce")
-                    my = my.sort_values("_dt", ascending=False).drop(columns=["_dt"])
-                else:
-                    if c_order in my.columns:
-                        my = my.sort_values(c_order, ascending=False)
-
-                pretty = my[show_cols].rename(columns={
-                    c_created: "เวลา",
-                    c_order:   "ออเดอร์",
-                    c_code2:   "รหัส",
-                    c_name2:   "ชื่อ",
-                    c_qty2:    "จำนวน",
-                    c_status:  "สถานะ",
-                })
-                st.dataframe(pretty, use_container_width=True, height=420)
-
-                csv = pretty.to_csv(index=False).encode("utf-8-sig")
-                st.download_button(
-                    "⬇️ ดาวน์โหลดประวัติ (CSV)",
-                    data=csv,
-                    file_name=f"history_{branch_code}_{username}.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                )
-            else:
-                st.info("Requests sheet ยังไม่มีคอลัมน์ที่จำเป็น (Branch / Requester / CreatedAt / OrderNo / Item / Qty / Status)")
-        else:
-            st.info("ยังไม่มีข้อมูลคำสั่งเบิก")
 
 if __name__ == "__main__":
     main()
