@@ -3,3 +3,4 @@ gspread
 google-auth
 pandas
 bcrypt
+streamlit-aggrid==0.3.4.post3
