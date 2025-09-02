@@ -76,23 +76,73 @@ def _safe_rerun():
         try: st.experimental_rerun()
         except Exception: pass
 
+
 def _get_sa_dict_from_secrets():
-    try: s = st.secrets
-    except Exception: s = {}
+    """Return a dict of Google Service Account credentials from secrets/env.
+
+    Accepted forms:
+    - st.secrets["GOOGLE_SERVICE_ACCOUNT_JSON"] as dict or JSON string
+    - st.secrets["gcp_service_account"] as dict (Streamlit Cloud default)
+    - Individual keys at the root of st.secrets (type, project_id, ...)
+    - Environment variable GOOGLE_SERVICE_ACCOUNT_JSON (dict/JSON/base64/file path)
+    - Environment variable GCP_SERVICE_ACCOUNT (same as above)
+    """
+    def _try_parse_json_string(s):
+        try:
+            return json.loads(s)
+        except Exception:
+            # base64?
+            try:
+                dec = base64.b64decode(s).decode("utf-8")
+                return json.loads(dec)
+            except Exception:
+                # file path?
+                try:
+                    if os.path.exists(s):
+                        with open(s, "r", encoding="utf-8") as f:
+                            return json.load(f)
+                except Exception:
+                    pass
+        return None
+
+    try:
+        s = st.secrets
+    except Exception:
+        s = {}
+
+    # 1) Streamlit secrets common keys
     if isinstance(s, dict):
         if "GOOGLE_SERVICE_ACCOUNT_JSON" in s:
             raw = s["GOOGLE_SERVICE_ACCOUNT_JSON"]
+            if isinstance(raw, dict):
+                return dict(raw)
             if isinstance(raw, str):
-                try: return json.loads(raw)
-                except Exception: pass
-            if isinstance(raw, dict): return dict(raw)
-        if "gcp_service_account" in s and isinstance(s["gcp_service_account"], dict):
-            return dict(s["gcp_service_account"])
+                parsed = _try_parse_json_string(raw)
+                if parsed: return parsed
+        for k in ("gcp_service_account", "service_account"):
+            if k in s and isinstance(s[k], dict):
+                return dict(s[k])
+        # Individual fields at root
         fields = ["type","project_id","private_key_id","private_key","client_email","client_id",
                   "auth_uri","token_uri","auth_provider_x509_cert_url","client_x509_cert_url"]
         if all(k in s for k in fields):
-            return {k:s[k] for k in fields}
+            return {k: s[k] for k in fields}
+
+    # 2) Environment variables
+    for envk in ("GOOGLE_SERVICE_ACCOUNT_JSON","GCP_SERVICE_ACCOUNT","SERVICE_ACCOUNT_JSON"):
+        val = os.environ.get(envk)
+        if not val:
+            continue
+        parsed = None
+        if val.strip().startswith("{"):
+            parsed = _try_parse_json_string(val)
+        else:
+            parsed = _try_parse_json_string(val)
+        if parsed:
+            return parsed
+
     return None
+
 
 def _sheet_loc():
     out = {}
