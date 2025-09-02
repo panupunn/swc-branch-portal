@@ -31,33 +31,6 @@ APP_TITLE = "WishCo Branch Portal — เบิกอุปกรณ์"
 TZ = timezone(timedelta(hours=7))
 
 # ====================== Utilities ======================
-
-# ---- Ensure Users sheet headers standard ----
-def ensure_users_headers():
-    try:
-        client, ss = get_client_and_ss()
-        try:
-            ws = ss.worksheet("Users")
-        except WorksheetNotFound:
-            ws = ss.add_worksheet("Users", rows=100, cols=10)
-        desired = ["Username","BranchCode","Password","PasswordHash","DisplayName"]
-        vals = with_retry(ws.get_values, "A1:E1")
-        header = [c.strip() for c in (vals[0] if vals else [])]
-        def _norm(x): return re.sub(r"\s+","", str(x or "")).strip().lower()
-        expected = {_norm(h) for h in desired}
-        actual = {_norm(h) for h in header if h}
-        if not actual or not (actual & expected):
-            with_retry(ws.update, "A1:E1", [desired])
-            try:
-                st.cache_data.clear()
-            except Exception:
-                pass
-            return True
-        return False
-    except Exception as e:
-        st.warning(f"Ensure Users header failed: {e}")
-        return False
-
 def do_rerun():
     try:
         st.rerun()
@@ -268,81 +241,35 @@ def read_requests_df() -> pd.DataFrame:
 # ====================== App ======================
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
-    
-# ---------- Health Check Page ----------
-def render_health_check():
-    st.header("🩺 Health Check — การเชื่อมต่อและโครงสร้างสเปรดชีต", anchor=False)
-    # Secrets keys
+    st.title(APP_TITLE)
+
+    client, ss = get_client_and_ss()
     try:
-        keys = list(st.secrets.keys())
-        st.info("พบคีย์ใน secrets.toml: " + ", ".join(f"`{k}`" for k in keys))
-    except Exception as e:
-        st.error(f"โหลด secrets ไม่ได้: {e}")
-    # Connect
-    try:
-        client, ss = get_client_and_ss()
-        st.success(f"เชื่อมต่อได้: **{ss.title}**")
-        st.caption(f"Spreadsheet ID: `{ss.id}`")
-    except Exception as e:
-        st.exception(e); st.stop()
-    # Worksheets
-    required = ["Users","Items","Requests"]
-    try:
-        ws_names = [w.title for w in ss.worksheets()]
-    except Exception as e:
-        ws_names = []; st.warning(f"อ่านรายชื่อแท็บไม่ได้: {e}")
-    cols = st.columns(2)
-    with cols[0]: st.write("Worksheets:", ws_names or "—")
-    with cols[1]:
-        missing = [w for w in required if w not in ws_names]
-        st.success("มีแท็บหลักครบ") if not missing else st.error("ขาด: " + ", ".join(missing))
-    # Users header
-    try:
-        ws_u = ss.worksheet("Users")
+        st.caption(f"Service Account: `{client.auth.service_account_email}`")
     except Exception:
-        ws_u = None
-    if ws_u:
-        vals = with_retry(ws_u.get_values, "A1:E1")
-        header = [c.strip() for c in (vals[0] if vals else [])]
-        st.write("Users header:", header)
-        desired = ["Username","BranchCode","Password","PasswordHash","DisplayName"]
-        need_fix = not header or not any(h.strip() for h in header) or not set(h.lower() for h in header) & set(h.lower() for h in desired)
-        if need_fix and st.button("🛠️ แก้หัวตาราง Users"):
-            with_retry(ws_u.update, "A1:E1", [desired])
-            st.success("อัปเดตหัว Users แล้ว")
-        if st.button("➕ สร้างผู้ใช้ตัวอย่าง (swc001 / 1234)"):
-            try:
-                ensure_users_headers()
-                dfu = read_sheet_as_df("Users")
-            except Exception:
-                dfu = pd.DataFrame()
-            except Exception:
-                dfu = pd.DataFrame()
-            seen = False
-            if not dfu.empty:
-                cu = find_col_fuzzy(dfu, {"username","user","ชื่อผู้ใช้"})
-                if cu: seen = dfu[cu].astype(str).str.casefold().eq("swc001").any()
-            if not seen:
-                with_retry(ws_u.append_row, ["swc001","SWC001","1234","","สาขาทดสอบ 001"], value_input_option="USER_ENTERED")
-                st.success("เพิ่มผู้ใช้ตัวอย่างแล้ว")
-            else:
-                st.info("มีผู้ใช้ swc001 อยู่แล้ว")
-    st.caption("เคล็ดลับ: Health Check ใช้ซ่อมโครงสร้าง Users/สิทธิ์เบื้องต้นก่อนล็อกอิน")
+        pass
 
-st.title(APP_TITLE)
-
-client, ss = get_client_and_ss()
-try:
-    st.caption(f"Service Account: `{client.auth.service_account_email}`")
-except Exception:
-    pass
-
-# ---------- Login ----------
-    st.sidebar.subheader("เข้าสู่ระบบสำหรับสาขา/หน่วยงาน")
-    page_choice = st.sidebar.radio("เมนู", ["เข้าสู่ระบบ", "🩺 Health Check"], index=0)
-    if page_choice == "🩺 Health Check":
-        render_health_check()
+    # ---------- Login ----------
+    
+    # ---------- Menu ----------
+    menu = st.sidebar.radio("เมนู", ["เข้าสู่ระบบ", "Health Check"], index=0)
+    if menu == "Health Check":
+        st.header("🩺 Health Check — การเชื่อมต่อและโครงสร้างสเปรดชีต")
+        # แสดงถึงระดับตามภาพเท่านั้น
+        found_keys = []
+        if st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON"): found_keys.append("GOOGLE_SERVICE_ACCOUNT_JSON")
+        if st.secrets.get("SHEET_URL"): found_keys.append("SHEET_URL")
+        if st.secrets.get("SHEET_ID"): found_keys.append("SHEET_ID")
+        st.info("พบคีย์ใน secrets.toml: " + (", ".join(found_keys) if found_keys else "—"))
+        try:
+            client, ss = get_client_and_ss()
+            st.success(f"เชื่อมต่อได้: {ss.title}")
+        except Exception as e:
+            st.error(f"เชื่อมต่อสเปรดชีตไม่สำเร็จ: {e}")
         st.stop()
+
+    # ---------- Login ----------
+    st.sidebar.subheader("เข้าสู่ระบบสำหรับสาขา/หน่วยงาน")
     if "auth" not in st.session_state:
         st.session_state["auth"] = False
         st.session_state["user"] = {}
@@ -350,8 +277,8 @@ except Exception:
     if not st.session_state["auth"]:
         u = st.sidebar.text_input("ชื่อผู้ใช้")
         p = st.sidebar.text_input("รหัสผ่าน", type="password")
+
         if st.sidebar.button("ล็อกอิน", use_container_width=True):
-            ensure_users_headers()
             dfu = read_sheet_as_df("Users")
             if dfu.empty:
                 st.sidebar.error("ไม่มีผู้ใช้ในชีต Users"); st.stop()
@@ -360,39 +287,61 @@ except Exception:
             cp = find_col_fuzzy(dfu, {"password", "รหัสผ่าน"})
             cph = find_col_fuzzy(dfu, {"passwordhash", "hash", "รหัสผ่านแบบแฮช"})
             cb = find_col_fuzzy(dfu, {"BranchCode", "สาขา", "branch"})
-            if not (cu and cb and (cp or cph)):
-                st.sidebar.error("Users sheet ไม่ครบคอลัมน์ (ต้องมี Username, BranchCode และ Password หรือ PasswordHash)"); st.stop()
+            cactive = find_col_fuzzy(dfu, {"active", "สถานะ", "ใช้งาน"})
+            # ต้องมี Username และ Password/PasswordHash; BranchCode เป็นตัวเลือก
+            if not (cu and (cp or cph)):
+                st.sidebar.error("Users sheet ไม่ครบคอลัมน์ (ต้องมี Username และ Password หรือ PasswordHash)"); st.stop()
 
             # normalize present columns
-            for c in filter(None, (cu, cp, cph, cb)):
+            for c in filter(None, (cu, cp, cph, cb, cactive)):
                 dfu[c] = dfu[c].astype(str).str.strip()
+
             row = dfu[dfu[cu].str.casefold() == (u or "").strip().casefold()].head(1)
+
             if row.empty:
                 st.sidebar.error("ไม่พบผู้ใช้หรือรหัสผ่านไม่ถูกต้อง")
             else:
-                ok = False
-                try:
-                    if cph and str(row.iloc[0][cph]).strip():
-                        if bcrypt:
-                            try:
-                                ok = bcrypt.checkpw((p or "").encode("utf-8"), str(row.iloc[0][cph]).encode("utf-8"))
-                            except Exception:
-                                ok = False
-                except Exception:
-                    ok = False
-                if not ok and cp:
-                    if str(row.iloc[0][cp]).strip() == (p or "").strip():
-                        ok = True
-                if not ok:
-                    st.sidebar.error("ไม่พบผู้ใช้หรือรหัสผ่านไม่ถูกต้อง")
+                # ตรวจ Active
+                if cactive and str(row.iloc[0][cactive]).strip().upper() in {"N","NO","0","FALSE"}:
+                    st.sidebar.error("บัญชีนี้ถูกปิดการใช้งาน")
                 else:
-                    st.session_state["auth"] = True
-                    st.session_state["user"] = {
-                        "username": (u or "").strip(),
-                        "branch": str(row.iloc[0][cb]).strip(),
-                    }
-                    st.sidebar.success(f"ยินดีต้อนรับ {st.session_state['user']['username']}")
-                    time.sleep(0.5); do_rerun()
+                    ok = False
+                    try:
+                        if cph and str(row.iloc[0][cph]).strip():
+                            if bcrypt:
+                                try:
+                                    ok = bcrypt.checkpw((p or "").encode("utf-8"), str(row.iloc[0][cph]).encode("utf-8"))
+                                except Exception:
+                                    ok = False
+                    except Exception:
+                        ok = False
+                    if not ok and cp:
+                        if str(row.iloc[0][cp]).strip() == (p or "").strip():
+                            ok = True
+                    if not ok:
+                        st.sidebar.error("ไม่พบผู้ใช้หรือรหัสผ่านไม่ถูกต้อง")
+                    else:
+                        # หา BranchCode ถ้าไม่มี ให้เดาจากแท็บ Branches หรือกำหนดค่าเริ่มต้น
+                        def _default_branch():
+                            try:
+                                dfb = read_sheet_as_df("Branches")
+                                cbcode = find_col_fuzzy(dfb, {"BranchCode","Code","รหัส","branch"})
+                                if not dfb.empty and cbcode:
+                                    v = str(dfb.iloc[0][cbcode]).strip()
+                                    return v if v else "SWC000"
+                            except Exception:
+                                pass
+                            return "SWC000"
+
+                        branch_val = str(row.iloc[0][cb]).strip() if cb else _default_branch()
+
+                        st.session_state["auth"] = True
+                        st.session_state["user"] = {
+                            "username": (u or "").strip(),
+                            "branch": branch_val,
+                        }
+                        st.sidebar.success(f"ยินดีต้อนรับ {st.session_state['user']['username']}")
+                        time.sleep(0.5); do_rerun()
         st.stop()
 
     if st.sidebar.button("ออกจากระบบ"):
@@ -401,6 +350,8 @@ except Exception:
         do_rerun()
 
     branch_code = st.session_state["user"]["branch"]
+    username = st.session_state["user"]["username"]
+branch_code = st.session_state["user"]["branch"]
     username = st.session_state["user"]["username"]
 
     # ---------- Tabs ----------
