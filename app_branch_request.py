@@ -287,7 +287,11 @@ def page_login():
 
 
 def page_issue():
+    # Predefine locals to avoid UnboundLocalError
     user = st.session_state.get("user", {})
+    ss = None
+    items = pd.DataFrame()
+
     st.title("WishCo Branch Portal — เบิกอุปกรณ์")
     st.caption(f"ผู้ใช้: **{user.get('username','')}** | สาขา: **{user.get('branch_code','')}**")
 
@@ -332,6 +336,10 @@ def page_issue():
         },
         key="issue_table",
     )
+
+    # Clear-all selections (inline)
+    if st.button("ล้างที่เลือกทั้งหมด", use_container_width=True):
+        st.session_state["sel_map"].clear(); st.session_state["qty_map"].clear(); _safe_rerun()
 
     # Auto-qty=1 for newly ticked rows
     changed = False
@@ -414,14 +422,28 @@ def page_issue():
             gb.configure_column("จำนวนที่เบิก", editable=True, width=160,
                                 cellRenderer=js_plus_minus, valueParser=JsCode("function(x){return Number(x.newValue)||0;}"))
             gb.configure_grid_options(domLayout='autoHeight', suppressClickEdit=False)
-            grid = AgGrid(
-                sum_df,
-                gridOptions=gb.build(),
-                update_mode=GridUpdateMode.VALUE_CHANGED,
-                allow_unsafe_jscode=True,
-                fit_columns_on_grid_load=True,
-            )
-            updated = pd.DataFrame(grid["data"])
+            try:
+                grid = AgGrid(
+                    sum_df,
+                    gridOptions=gb.build(),
+                    update_mode=GridUpdateMode.VALUE_CHANGED,
+                    allow_unsafe_jscode=True,
+                    fit_columns_on_grid_load=True,
+                )
+                updated = pd.DataFrame(grid.get("data", sum_df))
+            except Exception:
+                # Fallback to plain editor when AgGrid has runtime issues
+                tmp = st.data_editor(
+                    sum_df, hide_index=True, use_container_width=True,
+                    column_config={
+                        "รหัส": st.column_config.TextColumn("รหัส", disabled=True),
+                        "รายการ": st.column_config.TextColumn("รายการ", disabled=True),
+                        "จำนวนที่เบิก": st.column_config.NumberColumn("จำนวนที่เบิก", min_value=0, step=1, format="%d"),
+                        "หน่วย": st.column_config.TextColumn("หน่วย", disabled=True),
+                    },
+                    key="summary_editor_fallback",
+                )
+                updated = tmp
             # persist back to session qty_map
             for _, r in updated.iterrows():
                 st.session_state["qty_map"][str(r["รหัส"])] = int(r["จำนวนที่เบิก"] or 0)
