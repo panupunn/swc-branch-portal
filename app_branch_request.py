@@ -228,26 +228,8 @@ def get_or_create_ws(ss, title: str, rows: int = 1000, cols: int = 26):
 def read_sheet_as_df(sheet_name: str) -> pd.DataFrame:
     _, ss = get_client_and_ss()
     ws = get_or_create_ws(ss, sheet_name, 1000, 26)
-    # ถ้าเป็นชีต Users ให้สร้าง/เติมหัวคอลัมน์ที่จำเป็นโดยอัตโนมัติ
-    if sheet_name.strip().lower() == "users":
-        required_headers = ["Username","BranchCode","Password","PasswordHash","DisplayName"]
-        try:
-            ensure_headers(ws, required_headers)
-        except Exception:
-            pass
     vals = with_retry(ws.get_all_values, announce=True)
-    if not vals:
-        # ถ้าเป็น Users และยังไม่มีข้อมูล ให้คืน DataFrame พร้อมคอลัมน์มาตรฐาน
-        if sheet_name.strip().lower() == "users":
-            return pd.DataFrame(columns=["Username","BranchCode","Password","PasswordHash","DisplayName"])
-        return pd.DataFrame()
-    # กันกรณี header ว่าง
-    if not vals[0]:
-        if sheet_name.strip().lower() == "users":
-            vals[0] = ["Username","BranchCode","Password","PasswordHash","DisplayName"]
-        else:
-            vals[0] = [f"C{i+1}" for i in range(len(vals[1]) if len(vals)>1 else 0)]
-    return pd.DataFrame(vals[1:], columns=vals[0])
+    return pd.DataFrame(vals[1:], columns=vals[0]) if vals else pd.DataFrame()
 
 @st.cache_data(ttl=90, show_spinner=False)
 def read_requests_df() -> pd.DataFrame:
@@ -255,6 +237,36 @@ def read_requests_df() -> pd.DataFrame:
     ws = get_or_create_ws(ss, "Requests", 2000, 26)
     vals = with_retry(ws.get_all_values, announce=True)
     return pd.DataFrame(vals[1:], columns=vals[0]) if vals else pd.DataFrame()
+def ensure_users_headers():
+    """Ensure Users sheet has at least the standard headers.
+    It creates the worksheet if missing and writes header row if empty or malformed.
+    """
+    try:
+        _, ss = get_client_and_ss()
+        ws = get_or_create_ws(ss, "Users", 1000, 10)
+        # peek values
+        vals = with_retry(ws.get_all_values, announce=False)
+        desired = ["Username","BranchCode","Password","PasswordHash","DisplayName"]
+        if not vals:
+            # empty sheet: write header
+            with_retry(ws.update, "A1:E1", [desired])
+            st.cache_data.clear()
+            return True
+        # has some data; check header row
+        header = [c.strip() for c in (vals[0] if vals else [])]
+        # if every header cell blank or not matching any expected keywords, write desired
+        def _norm(x): return re.sub(r"\s+", "", str(x or "")).strip().lower()
+        expected_norms = { _norm(h) for h in desired }
+        header_norms = [ _norm(h) for h in header ]
+        if not any(header_norms) or not any(h in expected_norms for h in header_norms):
+            with_retry(ws.update, "A1:E1", [desired])
+            st.cache_data.clear()
+            return True
+    except Exception:
+        # Don't hard fail login on header fix; show details in expander
+        st.warning("ตรวจพบ Users sheet ไม่สมบูรณ์: ระบบพยายามตั้งหัวตารางให้อัตโนมัติ")
+    return False
+
 
 # ====================== App ======================
 def main():
@@ -277,6 +289,7 @@ def main():
         u = st.sidebar.text_input("ชื่อผู้ใช้")
         p = st.sidebar.text_input("รหัสผ่าน", type="password")
         if st.sidebar.button("ล็อกอิน", use_container_width=True):
+            ensure_users_headers()
             dfu = read_sheet_as_df("Users")
             if dfu.empty:
                 st.sidebar.error("ไม่มีผู้ใช้ในชีต Users"); st.stop()
@@ -291,6 +304,8 @@ def main():
             # normalize present columns
             for c in filter(None, (cu, cp, cph, cb)):
                 dfu[c] = dfu[c].astype(str).str.strip()
+
+            # select row by username (case-insensitive)
             row = dfu[dfu[cu].str.casefold() == (u or "").strip().casefold()].head(1)
             if row.empty:
                 st.sidebar.error("ไม่พบผู้ใช้หรือรหัสผ่านไม่ถูกต้อง")
@@ -311,14 +326,15 @@ def main():
                 if not ok:
                     st.sidebar.error("ไม่พบผู้ใช้หรือรหัสผ่านไม่ถูกต้อง")
                 else:
-                st.session_state["auth"] = True
-                st.session_state["user"] = {
-                    "username": (u or "").strip(),
-                    "branch": str(row.iloc[0][cb]).strip(),
-                }
-                st.sidebar.success(f"ยินดีต้อนรับ {st.session_state['user']['username']}")
-                time.sleep(0.5); do_rerun()
-        st.stop()
+                    st.session_state["auth"] = True
+                    st.session_state["user"] = {
+                        "username": (u or "").strip(),
+                        "branch": str(row.iloc[0][cb]).strip(),
+                    }
+                    st.sidebar.success(f"ยินดีต้อนรับ {st.session_state['user']['username']}")
+                    time.sleep(0.5); do_rerun()
+            st.stop()
+
 
     if st.sidebar.button("ออกจากระบบ"):
         st.session_state["auth"] = False
