@@ -265,17 +265,34 @@ def main():
 
             cu = find_col_fuzzy(dfu, {"username", "user", "บัญชีผู้ใช้", "ชื่อผู้ใช้"})
             cp = find_col_fuzzy(dfu, {"password", "รหัสผ่าน"})
+            cph = find_col_fuzzy(dfu, {"passwordhash", "hash", "รหัสผ่านแบบแฮช"})
             cb = find_col_fuzzy(dfu, {"BranchCode", "สาขา", "branch"})
-            if not (cu and cp and cb):
-                st.sidebar.error("Users sheet ไม่ครบคอลัมน์"); st.stop()
+            if not (cu and cb and (cp or cph)):
+                st.sidebar.error("Users sheet ไม่ครบคอลัมน์ (ต้องมี Username, BranchCode และ Password หรือ PasswordHash)"); st.stop()
 
-            for c in (cu, cp, cb):
+            # normalize present columns
+            for c in filter(None, (cu, cp, cph, cb)):
                 dfu[c] = dfu[c].astype(str).str.strip()
-
-            row = dfu[dfu[cu].str.casefold() == (u or "").strip().casefold()].head(1)
-            if row.empty or str(row.iloc[0][cp]).strip() != (p or "").strip():
+row = dfu[dfu[cu].str.casefold() == (u or "").strip().casefold()].head(1)
+            if row.empty:
                 st.sidebar.error("ไม่พบผู้ใช้หรือรหัสผ่านไม่ถูกต้อง")
             else:
+                ok = False
+                try:
+                    if cph and str(row.iloc[0][cph]).strip():
+                        if bcrypt:
+                            try:
+                                ok = bcrypt.checkpw((p or "").encode("utf-8"), str(row.iloc[0][cph]).encode("utf-8"))
+                            except Exception:
+                                ok = False
+                except Exception:
+                    ok = False
+                if not ok and cp:
+                    if str(row.iloc[0][cp]).strip() == (p or "").strip():
+                        ok = True
+                if not ok:
+                    st.sidebar.error("ไม่พบผู้ใช้หรือรหัสผ่านไม่ถูกต้อง")
+                else:
                 st.session_state["auth"] = True
                 st.session_state["user"] = {
                     "username": (u or "").strip(),
